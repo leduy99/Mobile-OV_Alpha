@@ -1,0 +1,37 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Local environments and IDE
+.venv/
+venv/
+.env
+.vscode/
+
+# Runtime logs and artifacts
+*.log
+output/
+
+# Datasets and downloaded media
+data/
+data_stage1/
+download_data/
+
+# Checkpoints and model caches
+omni_ckpts/
+.hf_cache/
+
+# Temporary and profiling files
+*.tmp
+*.temp
+*.swp
+*.swo
+.prof
+*.trace
+
+# OS noise
+.DS_Store
+Thumbs.db

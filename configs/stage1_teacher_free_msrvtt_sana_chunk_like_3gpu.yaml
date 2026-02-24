@@ -1,6 +1,6 @@
 run:
   seed: 1234
-  output_dir: output/stage1_teacher_free_msrvtt_sana_nochunk_nochi_anticollapse
+  output_dir: output/stage1_teacher_free_msrvtt_sana_chunk_like
   log_every: 20
   save_every_steps: 200
   num_workers: 0
@@ -79,7 +79,6 @@ model:
     deepspeed_config: configs/train_config/zero1_config.json
     deepspeed_zero_stage: 0
     deepspeed_dist_init_required: true
-    chunk_index: null
     lora:
       enable: false
       r: 8
@@ -92,7 +91,7 @@ model:
       include_patterns:
       - cross_attn
 sana:
-  config: configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml
+  config: configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp_chunk.yaml
   dit_ckpt: omni_ckpts/sana_video_2b_480p
   timesteps:
     num_train_timesteps: 1000
@@ -107,7 +106,7 @@ data:
     normalize_whitespace: true
     strip: true
     remove_double_newlines: true
-    use_chi_prompt: false
+    use_chi_prompt: true
     use_prompt_templates: false
     max_prompt_tokens: 200
   motion_score: 10
@@ -129,9 +128,6 @@ train:
   chunk_sampling_strategy: uniform
   same_timestep_prob: 0.0
   timestep_weight: false
-  lr_schedule: constant
-  lr_schedule_args:
-    num_warmup_steps: 500
   optimizer:
     betas:
     - 0.9
@@ -159,8 +155,8 @@ loss:
       preload: false
       max_cached_shards: 2
   semantic_probe:
-    enabled: true
-    weight: 0.2
+    enabled: false
+    weight: 0.0
     var_weight: 1.0
     cov_weight: 0.05
     geom_weight: 1.0

@@ -1,6 +1,6 @@
 run:
   seed: 1234
-  output_dir: output/stage1_teacher_free_msrvtt_sana_nochunk_nochi_anticollapse
+  output_dir: output/stage1_teacher_free_msrvtt_real
   log_every: 20
   save_every_steps: 200
   num_workers: 0
@@ -13,14 +13,14 @@ run:
   student_fsdp: false
   student_sync: true
   dit_sync: true
-  manual_sync_backend: nccl
+  manual_sync_backend: gloo
   use_barrier: false
   dit_ddp_find_unused_parameters: false
   student_ddp_find_unused_parameters: false
   sync_bucket_max_elems: 25000000
   log_lora_grad: false
   debug_probe_every_steps: 100
-  cfg_dropout_prob: 0.0
+  cfg_dropout_prob: 0.00
   cfg_delta_every_steps: 0
   cfg_delta_uncond_prompt: ''
   cfg_uncond_detach_bridge: true
@@ -75,11 +75,10 @@ model:
     - all
     fsdp: false
     ddp: false
-    deepspeed: false
+    deepspeed: true
     deepspeed_config: configs/train_config/zero1_config.json
     deepspeed_zero_stage: 0
     deepspeed_dist_init_required: true
-    chunk_index: null
     lora:
       enable: false
       r: 8
@@ -119,7 +118,7 @@ data:
   - 'A cinematic video of {prompt}. motion score: {motion_score}.'
   batching:
     batch_size: 1
-    grad_accum_steps: 1
+    grad_accum_steps: 8
     shuffle: true
     drop_last: true
 train:
@@ -129,9 +128,8 @@ train:
   chunk_sampling_strategy: uniform
   same_timestep_prob: 0.0
   timestep_weight: false
-  lr_schedule: constant
-  lr_schedule_args:
-    num_warmup_steps: 500
+  latent_window:
+    frames: 13
   optimizer:
     betas:
     - 0.9
@@ -143,17 +141,16 @@ train:
     dit: 1.0e-05
     warmup_steps: 1000
     min_lr_ratio: 0.1
-    max_grad_norm: 0.1
+    max_grad_norm: 1.0
 loss:
-  aux_start_step: 1
   diff:
     weight: 1.0
   distill:
     enabled: false
     use_attention_mask: true
-    token_mse_weight: 0.0
-    token_cos_weight: 0.0
-    pooled_cos_weight: 0.0
+    token_mse_weight: 0.5
+    token_cos_weight: 0.25
+    pooled_cos_weight: 0.1
     precomputed:
       dir: output/precomputed_teacher/openvid_subset_teacher_full
       preload: false
