@@ -1,0 +1,175 @@
+run:
+  seed: 1234
+  output_dir: output/stage1_teacher_free_msrvtt_sana_nochunk_nochi_anticollapse
+  log_every: 20
+  save_every_steps: 200
+  num_workers: 0
+  precision: bf16
+  gradient_checkpointing: true
+  student_ddp: false
+  student_fsdp: false
+  student_sync: true
+  dit_sync: true
+  manual_sync_backend: nccl
+  use_barrier: false
+  dit_ddp_find_unused_parameters: false
+  student_ddp_find_unused_parameters: false
+  sync_bucket_max_elems: 25000000
+  log_lora_grad: false
+  debug_probe_every_steps: 100
+  cfg_dropout_prob: 0.0
+  cfg_delta_every_steps: 0
+  cfg_delta_uncond_prompt: ''
+  cfg_uncond_detach_bridge: true
+  cfg_uncond_fixed_eval: true
+  debug_probe_prompts:
+  - a cat playing with a wool beside a fireside
+  - a fox running through a snowy forest at sunrise
+  - a red sports car drifting on a wet city street at night
+  - an astronaut floating above earth in space
+  - waves crashing against cliffs during a storm
+  - a chef slicing vegetables in a busy kitchen
+model:
+  student:
+    text_encoder:
+      ckpt_path: omni_ckpts/smolvlm2_500m/smolvlm2_500m.pt
+      max_length: 512
+      tokenizer_model_id: HuggingFaceTB/SmolVLM-Instruct
+    vision_head_frozen: true
+    use_vision_head: false
+    conditioner_bridge:
+      out_seq_len: 300
+      out_dim: 2304
+    adapter_ckpt_dir: null
+    adapter_in_channels: 960
+    adapter_out_channels: 2304
+    adapter_query_length: 128
+    force_adapter_query_length: 128
+    smol_vh_num_queries: 1
+    adapter_num_encoder_layers: 2
+    adapter_num_decoder_layers: 2
+    adapter_ff_mult: 2
+    resampler_num_heads: 8
+    resampler_mlp_mult: 2
+    gate_min_value: 0.0
+    lora:
+      enable: false
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      target_modules:
+      - q_proj
+      - v_proj
+    projector:
+      type: mcp_full
+      mcp_hidden_dim: 1536
+      mcp_num_fuse_layers: 4
+      mcp_use_refine: true
+      mcp_refine_kernel_size: 3
+      mcp_fusion_temperature: 1.0
+  dit:
+    train_modules:
+    - all
+    fsdp: false
+    ddp: false
+    deepspeed: false
+    deepspeed_config: configs/train_config/zero1_config.json
+    deepspeed_zero_stage: 0
+    deepspeed_dist_init_required: true
+    chunk_index: null
+    lora:
+      enable: false
+      r: 8
+      alpha: 16
+      dropout: 0.05
+      target_modules:
+      - q_linear
+      - kv_linear
+      - proj
+      include_patterns:
+      - cross_attn
+sana:
+  config: configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml
+  dit_ckpt: omni_ckpts/sana_video_2b_480p
+  timesteps:
+    num_train_timesteps: 1000
+data:
+  openvid:
+    csv_path: data/msrvtt/OpenVid_extracted_subset_unique.csv
+    video_dir: data/msrvtt/videos
+    preprocessed_dir: data/msrvtt/preprocessed
+    use_preprocessed: true
+    max_samples: null
+  preprocessing:
+    normalize_whitespace: true
+    strip: true
+    remove_double_newlines: true
+    use_chi_prompt: false
+    use_prompt_templates: false
+    max_prompt_tokens: 200
+  motion_score: 10
+  prompt_templates:
+  - 'A video of {prompt}. motion score: {motion_score}.'
+  - 'Video: {prompt}. motion score: {motion_score}.'
+  - '{prompt}. motion score: {motion_score}.'
+  - 'A short video clip of {prompt}. motion score: {motion_score}.'
+  - 'A cinematic video of {prompt}. motion score: {motion_score}.'
+  batching:
+    batch_size: 1
+    grad_accum_steps: 1
+    shuffle: true
+    drop_last: true
+train:
+  total_steps: 100000
+  flow_shift: 3.0
+  use_sana_process_timesteps: true
+  chunk_sampling_strategy: uniform
+  same_timestep_prob: 0.0
+  timestep_weight: false
+  lr_schedule: constant
+  lr_schedule_args:
+    num_warmup_steps: 500
+  optimizer:
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    weight_decay: 0.0
+  lr:
+    bridge: 5.0e-05
+    dit: 1.0e-05
+    warmup_steps: 1000
+    min_lr_ratio: 0.1
+    max_grad_norm: 0.1
+loss:
+  aux_start_step: 1
+  diff:
+    weight: 1.0
+  distill:
+    enabled: false
+    use_attention_mask: true
+    token_mse_weight: 0.0
+    token_cos_weight: 0.0
+    pooled_cos_weight: 0.0
+    precomputed:
+      dir: output/precomputed_teacher/openvid_subset_teacher_full
+      preload: false
+      max_cached_shards: 2
+  semantic_probe:
+    enabled: true
+    weight: 0.2
+    var_weight: 1.0
+    cov_weight: 0.05
+    geom_weight: 1.0
+    target_std: 1.0
+    every_steps: 1
+    max_prompts: 8
+    prompts: []
+  norm:
+    enabled: false
+    weight: 0.0
+    target: 48.0
+  gate:
+    enabled: false
+    weight: 0.0
+    target: 1.0
