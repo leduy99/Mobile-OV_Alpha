@@ -336,3 +336,17 @@ Current overfit recipe for proof-of-concept:
   - Stopped the run.
   - Deleted the run artifacts above.
   - Re-run started from scratch with current code for fresh validation.
+
+## Conditioning Collapse Triage Note (2026-02-26)
+
+- Temporary diagnostics were added to `tools/train_stage1_teacher_free.py` to debug prompt-conditioning collapse:
+  - `cond_shuffle_dloss`: diffusion loss delta when condition embeddings are shuffled across batch.
+  - `cond_uncond_dloss`: diffusion loss delta when replacing condition with unconditioned embedding.
+  - `cond_grad`: gradient norm on conditioning embedding (`student_embeds_for_dit`).
+- Config switches:
+  - `run.conditioning_diag_every_steps`
+  - `run.conditioning_diag_shuffle`
+  - `run.conditioning_diag_uncond`
+  - `run.conditioning_diag_grad`
+- Cleanup intention:
+  - These diagnostics are explicitly temporary and should be removed after collapse root-cause is fixed.

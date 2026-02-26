@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import math
+import numpy as np
 import os
 import random
 import shutil
@@ -1142,24 +1143,128 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     # --------------------------
     # 2) Data + optimizer setup
     # --------------------------
-    # Dataset
+    # Dataset / dataloaders
     logger.info("Rank %s building dataset", rank)
     openvid_cfg = cfg.data.openvid
-    dataset = OpenVidDataset(
-        csv_path=openvid_cfg.csv_path,
+    expected_latent_t = getattr(openvid_cfg, "expected_latent_t", None)
+    if expected_latent_t is not None:
+        try:
+            expected_latent_t = int(expected_latent_t)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"data.openvid.expected_latent_t must be int, got {expected_latent_t!r}") from exc
+        if expected_latent_t < 1:
+            raise RuntimeError(f"data.openvid.expected_latent_t must be >=1, got {expected_latent_t}")
+    expected_frame_num = getattr(openvid_cfg, "expected_frame_num", None)
+    if expected_frame_num is not None:
+        try:
+            expected_frame_num = int(expected_frame_num)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"data.openvid.expected_frame_num must be int, got {expected_frame_num!r}") from exc
+        if expected_frame_num < 1:
+            raise RuntimeError(f"data.openvid.expected_frame_num must be >=1, got {expected_frame_num}")
+    joint_cfg = cfg.data.get("joint", AttrDict())
+    sana_train_cfg_for_joint = getattr(sana_cfg, "train", AttrDict())
+    joint_interval = int(
+        getattr(joint_cfg, "interval", getattr(sana_train_cfg_for_joint, "joint_training_interval", 0)) or 0
+    )
+    image_per_video_raw = getattr(joint_cfg, "image_per_video", None)
+    image_per_video = None
+    if image_per_video_raw is not None:
+        try:
+            parsed_ratio = int(image_per_video_raw)
+        except (TypeError, ValueError):
+            parsed_ratio = -1
+        if parsed_ratio > 0:
+            image_per_video = parsed_ratio
+        elif is_main:
+            logger.warning(
+                "Ignoring invalid joint.image_per_video=%r (must be positive integer)",
+                image_per_video_raw,
+            )
+    joint_use_image_ratio = image_per_video is not None
+    joint_enabled = bool(getattr(joint_cfg, "enabled", False)) and (joint_use_image_ratio or (joint_interval > 0))
+    video_modality = str(getattr(joint_cfg, "video_modality", "video") or "video").strip().lower()
+    image_modality = str(getattr(joint_cfg, "image_modality", "image") or "image").strip().lower()
+    video_csv_path = str(getattr(openvid_cfg, "csv_path_video", getattr(openvid_cfg, "csv_path", "")) or "")
+    image_csv_path = str(getattr(openvid_cfg, "csv_path_image", video_csv_path) or video_csv_path)
+    if not video_csv_path:
+        raise RuntimeError("data.openvid.csv_path is empty")
+
+    dataset_video = OpenVidDataset(
+        csv_path=video_csv_path,
         video_dir=openvid_cfg.video_dir,
         preprocessed_dir=openvid_cfg.preprocessed_dir,
         use_preprocessed=openvid_cfg.use_preprocessed,
         max_samples=openvid_cfg.get("max_samples"),
+        modality_filter=[video_modality] if joint_enabled else None,
     )
-    if is_main:
-        logger.info("Dataset initialized: %s samples", len(dataset))
-    else:
-        logger.info("Rank %s dataset initialized: %s samples", rank, len(dataset))
+    dataset_image = None
+    if joint_enabled:
+        image_max_samples = getattr(joint_cfg, "image_max_samples", None)
+        dataset_image = OpenVidDataset(
+            csv_path=image_csv_path,
+            video_dir=openvid_cfg.video_dir,
+            preprocessed_dir=openvid_cfg.preprocessed_dir,
+            use_preprocessed=openvid_cfg.use_preprocessed,
+            max_samples=image_max_samples,
+            modality_filter=[image_modality],
+        )
+        if len(dataset_video) == 0 or len(dataset_image) == 0:
+            if is_main:
+                logger.warning(
+                    "Joint 2-dataloader requested but dataset is empty "
+                    "(video=%d image=%d). Fallback to single dataloader.",
+                    len(dataset_video),
+                    len(dataset_image),
+                )
+            joint_enabled = False
+            dataset_image = None
 
-    sampler = None
+    if is_main:
+        if joint_enabled and dataset_image is not None:
+            if joint_use_image_ratio:
+                logger.info(
+                    "Datasets initialized: video=%d (%s), image=%d (%s), image_per_video=%d",
+                    len(dataset_video),
+                    video_modality,
+                    len(dataset_image),
+                    image_modality,
+                    image_per_video,
+                )
+            else:
+                logger.info(
+                    "Datasets initialized: video=%d (%s), image=%d (%s), interval=%d",
+                    len(dataset_video),
+                    video_modality,
+                    len(dataset_image),
+                    image_modality,
+                    joint_interval,
+                )
+        else:
+            logger.info("Dataset initialized: %s samples", len(dataset_video))
+        if expected_latent_t is not None or expected_frame_num is not None:
+            logger.info(
+                "Dataset temporal contract: expected_latent_t=%s expected_frame_num=%s",
+                expected_latent_t,
+                expected_frame_num,
+            )
+    else:
+        if joint_enabled and dataset_image is not None:
+            logger.info(
+                "Rank %s datasets initialized: video=%d image=%d",
+                rank,
+                len(dataset_video),
+                len(dataset_image),
+            )
+        else:
+            logger.info("Rank %s dataset initialized: %s samples", rank, len(dataset_video))
+
+    sampler_video = None
+    sampler_image = None
     if world_size > 1:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+        sampler_video = DistributedSampler(dataset_video, num_replicas=world_size, rank=rank, shuffle=True)
+        if joint_enabled and dataset_image is not None:
+            sampler_image = DistributedSampler(dataset_image, num_replicas=world_size, rank=rank, shuffle=True)
 
     num_workers = args.num_workers if args.num_workers is not None else cfg.run.num_workers
     loader_prefetch_factor = int(getattr(cfg.run, "prefetch_factor", 2) or 2)
@@ -1168,20 +1273,47 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = max(1, loader_prefetch_factor)
         dataloader_kwargs["persistent_workers"] = loader_persistent_workers
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size or cfg.data.batching.batch_size,
-        shuffle=(sampler is None and bool(cfg.data.batching.get("shuffle", True))),
-        sampler=sampler,
+
+    batch_size_video = int(args.batch_size or cfg.data.batching.batch_size)
+    batch_size_image = int(getattr(cfg.data.batching, "batch_size_image", batch_size_video) or batch_size_video)
+    shuffle_data = bool(cfg.data.batching.get("shuffle", True))
+    drop_last_video = bool(cfg.data.batching.drop_last)
+    drop_last_image = bool(getattr(cfg.data.batching, "drop_last_image", drop_last_video))
+
+    dataloader_video = DataLoader(
+        dataset_video,
+        batch_size=batch_size_video,
+        shuffle=(sampler_video is None and shuffle_data),
+        sampler=sampler_video,
         num_workers=num_workers,
         collate_fn=openvid_collate_fn,
-        drop_last=cfg.data.batching.drop_last,
+        drop_last=drop_last_video,
         pin_memory=True,
         timeout=60 if num_workers > 0 else 0,
         **dataloader_kwargs,
     )
+    dataloader_image = None
+    if joint_enabled and dataset_image is not None:
+        dataloader_image = DataLoader(
+            dataset_image,
+            batch_size=batch_size_image,
+            shuffle=(sampler_image is None and shuffle_data),
+            sampler=sampler_image,
+            num_workers=num_workers,
+            collate_fn=openvid_collate_fn,
+            drop_last=drop_last_image,
+            pin_memory=True,
+            timeout=60 if num_workers > 0 else 0,
+            **dataloader_kwargs,
+        )
     if is_main:
-        logger.info("Dataloader ready (num_workers=%s)", num_workers)
+        logger.info(
+            "Dataloader ready (num_workers=%s, joint=%s, video_batches=%d, image_batches=%d)",
+            num_workers,
+            joint_enabled,
+            len(dataloader_video),
+            (len(dataloader_image) if dataloader_image is not None else 0),
+        )
 
     # Optimizer
     if isinstance(student, FSDP):
@@ -1369,6 +1501,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     weighting_scheme = str(getattr(sana_sched_cfg, "weighting_scheme", "none"))
     weighting_logit_mean = float(getattr(sana_sched_cfg, "logit_mean", 0.0))
     weighting_logit_std = float(getattr(sana_sched_cfg, "logit_std", 1.0))
+    weighting_mode_scale = float(getattr(sana_sched_cfg, "mode_scale", 1.29))
     weighting_p_low = getattr(sana_sched_cfg, "p_low", None)
     weighting_p_high = getattr(sana_sched_cfg, "p_high", None)
     if weighting_p_low is not None:
@@ -1376,6 +1509,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     if weighting_p_high is not None:
         weighting_p_high = float(weighting_p_high)
     use_sana_process_timesteps = bool(getattr(cfg.train, "use_sana_process_timesteps", False))
+    force_ivjoint_timestep = bool(getattr(cfg.train, "force_ivjoint_timestep", False))
     same_timestep_prob = float(getattr(cfg.train, "same_timestep_prob", 0.0) or 0.0)
     same_timestep_prob = max(0.0, min(1.0, same_timestep_prob))
     chunk_sampling_strategy = str(getattr(cfg.train, "chunk_sampling_strategy", "uniform") or "uniform")
@@ -1401,6 +1535,10 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             chunk_index = [0] + chunk_index
         # Chunk-causal training expects frame-aware timestep tensors.
         use_sana_process_timesteps = True
+    if force_ivjoint_timestep:
+        # Upstream ivjoint baseline: global timestep sampling without chunk/frame-aware process_timesteps path.
+        use_sana_process_timesteps = False
+        chunk_index = None
     time_sampler = None
     if chunk_index is not None and use_sana_process_timesteps:
         time_sampler = IncrementalTimesteps(
@@ -1421,14 +1559,16 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     if is_main:
         logger.info(
             "SANA objective: train_sampling_steps=%d noise_schedule=%s predict_flow_v=%s flow_shift=%.3f "
-            "weighting_scheme=%s use_process_timesteps=%s chunk_index=%s chunk_sampling=%s time_sampler=%s "
-            "timestep_weight=%s",
+            "weighting_scheme=%s mode_scale=%.4f use_process_timesteps=%s force_ivjoint_timestep=%s "
+            "chunk_index=%s chunk_sampling=%s time_sampler=%s timestep_weight=%s",
             train_sampling_steps,
             noise_schedule,
             predict_flow_v,
             flow_shift,
             weighting_scheme,
+            weighting_mode_scale,
             use_sana_process_timesteps,
+            force_ivjoint_timestep,
             chunk_index,
             chunk_sampling_strategy,
             time_sampler is not None,
@@ -1469,6 +1609,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     cfg_delta_uncond_prompt = str(getattr(cfg.run, "cfg_delta_uncond_prompt", "") or "")
     cfg_uncond_detach_bridge = bool(getattr(cfg.run, "cfg_uncond_detach_bridge", True))
     cfg_uncond_fixed_eval = bool(getattr(cfg.run, "cfg_uncond_fixed_eval", True))
+    # TODO(cleanup): temporary conditioning-collapse diagnostics.
+    # Keep while triaging prompt-following collapse; remove once training is stable.
+    conditioning_diag_every = int(getattr(cfg.run, "conditioning_diag_every_steps", 0) or 0)
+    conditioning_diag_shuffle = bool(getattr(cfg.run, "conditioning_diag_shuffle", True))
+    conditioning_diag_uncond = bool(getattr(cfg.run, "conditioning_diag_uncond", True))
+    conditioning_diag_grad = bool(getattr(cfg.run, "conditioning_diag_grad", True))
     distill_cfg = cfg.loss.get("distill", AttrDict())
     distill_enabled = bool(getattr(distill_cfg, "enabled", False))
     distill_teacher_store = None
@@ -1619,6 +1765,14 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             cfg_uncond_detach_bridge,
             cfg_uncond_fixed_eval,
         )
+        if conditioning_diag_every > 0:
+            logger.info(
+                "Conditioning diagnostics: every=%d shuffle=%s uncond=%s grad=%s",
+                conditioning_diag_every,
+                conditioning_diag_shuffle,
+                conditioning_diag_uncond,
+                conditioning_diag_grad,
+            )
         if semantic_enabled:
             logger.info(
                 "Semantic anti-collapse enabled: weight=%.4f var=%.3f cov=%.3f geom=%.3f every=%d prompts=%d target_std=%.2f",
@@ -1666,6 +1820,16 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         "train_same_timestep_prob": float(same_timestep_prob),
         "train_use_process_timesteps": bool(use_sana_process_timesteps),
         "train_sana_config": str(cfg.sana.config),
+        "train_expected_latent_t": (int(expected_latent_t) if expected_latent_t is not None else None),
+        "train_expected_frame_num": (int(expected_frame_num) if expected_frame_num is not None else None),
+        "train_latent_t": None,
+        "train_effective_latent_t": None,
+        "train_frame_num": None,
+        "train_joint_enabled": bool(joint_enabled),
+        "train_joint_interval": int(joint_interval) if joint_enabled else 0,
+        "train_joint_image_per_video": int(image_per_video) if (joint_enabled and joint_use_image_ratio) else 0,
+        "train_joint_video_modality": str(video_modality),
+        "train_joint_image_modality": str(image_modality),
     }
 
     if world_size > 1 and use_barrier:
@@ -1774,7 +1938,13 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         deepspeed_zero_grad_compat(deepspeed_engine)
     micro_step = resume_micro_step
     update_step = resume_step
-    data_iter = iter(dataloader)
+    video_data_iter = iter(dataloader_video)
+    image_data_iter = iter(dataloader_image) if dataloader_image is not None else None
+    video_micro_count = 0
+    image_micro_count = 0
+    observed_train_latent_t = None
+    observed_train_effective_latent_t = None
+    observed_train_frame_num = None
 
     def get_fixed_uncond_batch(
         batch_size_local: int,
@@ -1793,6 +1963,26 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         m = m.expand(batch_size_local, -1).contiguous()
         return emb, m
 
+    def _extract_first_int(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, torch.Tensor):
+                if value.numel() <= 0:
+                    return None
+                return int(value.detach().flatten()[0].item())
+            if isinstance(value, np.ndarray):
+                if value.size <= 0:
+                    return None
+                return int(np.asarray(value).reshape(-1)[0])
+            if isinstance(value, (list, tuple)):
+                if len(value) <= 0:
+                    return None
+                return _extract_first_int(value[0])
+            return int(value)
+        except Exception:
+            return None
+
     # --------------------------
     # 3) Train loop
     # micro_step: dataloader step
@@ -1800,20 +1990,47 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     # --------------------------
     while update_step < total_steps:
         loop_t0 = time.time()
-        if sampler is not None:
-            sampler.set_epoch(micro_step)
+        if sampler_video is not None:
+            sampler_video.set_epoch(micro_step)
+        if sampler_image is not None:
+            sampler_image.set_epoch(micro_step)
+
+        if joint_enabled and (dataloader_image is not None):
+            if joint_use_image_ratio:
+                # Ratio schedule: 1 video step followed by N image steps.
+                # Example image_per_video=5 => V, I, I, I, I, I, V, ...
+                cycle_len = int(image_per_video) + 1
+                use_image_step = (update_step % cycle_len) != 0
+            else:
+                use_image_step = bool(
+                    (joint_interval > 0)
+                    and (update_step > 0)
+                    and (update_step % joint_interval == 0)
+                )
+        else:
+            use_image_step = False
+        active_batch_modality = "image" if use_image_step else "video"
 
         if is_main and micro_step == 0:
             logger.info("Entering training loop; waiting for first batch...")
         fetch_t0 = time.time()
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(dataloader)
-            batch = next(data_iter)
+        if use_image_step:
+            try:
+                batch = next(image_data_iter)
+            except StopIteration:
+                image_data_iter = iter(dataloader_image)
+                batch = next(image_data_iter)
+            image_micro_count += 1
+        else:
+            try:
+                batch = next(video_data_iter)
+            except StopIteration:
+                video_data_iter = iter(dataloader_video)
+                batch = next(video_data_iter)
+            video_micro_count += 1
         fetch_dt = time.time() - fetch_t0
         if is_main and micro_step == 0:
-            logger.info("First batch fetched in %.2fs", fetch_dt)
+            logger.info("First batch fetched in %.2fs (mode=%s)", fetch_dt, active_batch_modality)
 
         # Prompt path: dataset caption -> optional normalization/template/truncation.
         prompts = preprocess_prompts(batch["prompt"], cfg, rng, tokenizer=tokenizer, chi_prompt=chi_prompt_text)
@@ -1901,7 +2118,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         else:
             mask = student_prompt_mask.to(device=device, dtype=torch.long)
             if mask.shape[:2] != student_embeds_for_dit.shape[:2]:
-                # Safety fallback for malformed mask; keep training robust.
+                # TODO(cleanup): remove this silent fallback once mask pipeline is stable.
+                # Keeping all-ones here can hide conditioning-mask bugs during triage.
                 mask = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)
         if mask.dim() == 1:
             mask = mask.unsqueeze(0)
@@ -1915,6 +2133,36 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         latents = latents.to(device=device, dtype=dtype)
         if latents.dim() == 4:
             latents = latents.unsqueeze(0)
+        raw_latent_t = int(latents.shape[2])
+        if expected_latent_t is not None and raw_latent_t != expected_latent_t:
+            sample_idx_val = _extract_first_int(batch.get("sample_idx"))
+            raise RuntimeError(
+                "Latent T mismatch: expected data.openvid.expected_latent_t="
+                f"{expected_latent_t}, got {raw_latent_t} (mode={active_batch_modality}, sample_idx={sample_idx_val})."
+            )
+        if observed_train_latent_t is None:
+            observed_train_latent_t = raw_latent_t
+            infer_hints["train_latent_t"] = int(observed_train_latent_t)
+            if is_main:
+                logger.info("Observed train latent_t=%d (raw dataset)", observed_train_latent_t)
+        frame_num_val = _extract_first_int(batch.get("frame_num"))
+        if expected_frame_num is not None:
+            if frame_num_val is None:
+                raise RuntimeError(
+                    "Missing frame_num in batch while data.openvid.expected_frame_num is set "
+                    f"to {expected_frame_num}."
+                )
+            if frame_num_val != expected_frame_num:
+                sample_idx_val = _extract_first_int(batch.get("sample_idx"))
+                raise RuntimeError(
+                    "Frame count mismatch: expected data.openvid.expected_frame_num="
+                    f"{expected_frame_num}, got {frame_num_val} (mode={active_batch_modality}, sample_idx={sample_idx_val})."
+                )
+        if frame_num_val is not None and observed_train_frame_num is None:
+            observed_train_frame_num = int(frame_num_val)
+            infer_hints["train_frame_num"] = int(observed_train_frame_num)
+            if is_main:
+                logger.info("Observed train frame_num=%d", observed_train_frame_num)
         if is_main and micro_step == 0:
             logger.info("Latent shape %s dtype=%s", tuple(latents.shape), latents.dtype)
 
@@ -1956,6 +2204,11 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 latents = latents_btchw.view(b0, t0, c0, new_h, new_w).permute(0, 2, 1, 3, 4).contiguous()
 
         b, c, t, h, w = latents.shape
+        if observed_train_effective_latent_t is None:
+            observed_train_effective_latent_t = int(t)
+            infer_hints["train_effective_latent_t"] = int(observed_train_effective_latent_t)
+            if is_main:
+                logger.info("Observed train effective latent_t=%d (post-window)", observed_train_effective_latent_t)
         timesteps = torch.randint(0, train_sampling_steps, (b,), device=device).long()
         process_supported_weighting = {"logit_normal", "stretched_logit_normal", "mode"}
         if use_sana_process_timesteps and (weighting_scheme in process_supported_weighting):
@@ -1974,13 +2227,15 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 same_timestep_prob=same_timestep_prob,
                 time_sampler=time_sampler,
             ).long()
-        elif weighting_scheme in ["logit_normal"]:
+        elif weighting_scheme in ["logit_normal", "mode"]:
             u = compute_density_for_timestep_sampling(
                 weighting_scheme=weighting_scheme,
                 batch_size=b,
                 logit_mean=weighting_logit_mean,
                 logit_std=weighting_logit_std,
-                mode_scale=None,
+                mode_scale=weighting_mode_scale,
+                p_low=weighting_p_low,
+                p_high=weighting_p_high,
             )
             timesteps = (u * train_sampling_steps).long().to(device)
         elif use_sana_process_timesteps and is_main and update_step == 0 and micro_step == 0:
@@ -1991,6 +2246,43 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             )
 
         data_info = build_data_info(b, h, w, device=device)
+        batch_img_hw = batch.get("img_hw")
+        if batch_img_hw is not None:
+            if isinstance(batch_img_hw, torch.Tensor):
+                img_hw = batch_img_hw.to(device=device, dtype=torch.float32)
+            elif isinstance(batch_img_hw, list):
+                if len(batch_img_hw) > 0 and isinstance(batch_img_hw[0], torch.Tensor):
+                    img_hw = torch.stack([x.to(dtype=torch.float32) for x in batch_img_hw], dim=0).to(device=device)
+                else:
+                    img_hw = torch.tensor(batch_img_hw, device=device, dtype=torch.float32)
+            else:
+                img_hw = torch.tensor(batch_img_hw, device=device, dtype=torch.float32)
+            if img_hw.dim() == 1:
+                img_hw = img_hw.unsqueeze(0)
+            if img_hw.shape[0] == 1 and b > 1:
+                img_hw = img_hw.repeat(b, 1)
+            if img_hw.shape[0] == b and img_hw.shape[1] == 2:
+                data_info["img_hw"] = img_hw
+
+        batch_aspect_ratio = batch.get("aspect_ratio")
+        if batch_aspect_ratio is not None:
+            if isinstance(batch_aspect_ratio, torch.Tensor):
+                aspect_ratio = batch_aspect_ratio.to(device=device, dtype=torch.float32)
+            elif isinstance(batch_aspect_ratio, list):
+                if len(batch_aspect_ratio) > 0 and isinstance(batch_aspect_ratio[0], torch.Tensor):
+                    aspect_ratio = torch.stack([x.to(dtype=torch.float32) for x in batch_aspect_ratio], dim=0).to(device=device)
+                else:
+                    aspect_ratio = torch.tensor(batch_aspect_ratio, device=device, dtype=torch.float32)
+            else:
+                aspect_ratio = torch.tensor(batch_aspect_ratio, device=device, dtype=torch.float32)
+            if aspect_ratio.dim() == 0:
+                aspect_ratio = aspect_ratio.view(1, 1)
+            elif aspect_ratio.dim() == 1:
+                aspect_ratio = aspect_ratio.unsqueeze(1)
+            if aspect_ratio.shape[0] == 1 and b > 1:
+                aspect_ratio = aspect_ratio.repeat(b, 1)
+            if aspect_ratio.shape[0] == b:
+                data_info["aspect_ratio"] = aspect_ratio
         # SANA DiT expects condition as [B, 1, L, C] and mask as [B, L].
         model_kwargs = {
             "y": student_embeds_for_dit.unsqueeze(1),
@@ -2016,6 +2308,95 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         noisy_for_cfg = loss_term.get("x_t", latents)
         diff_weight = float(getattr(cfg.loss.get("diff", AttrDict()), "weight", 1.0))
         is_sync_step = (micro_step + 1) % grad_accum_steps == 0
+        run_conditioning_diag = bool(
+            is_sync_step
+            and conditioning_diag_every > 0
+            and ((update_step + 1) % conditioning_diag_every == 0)
+        )
+        cond_diag_shuffle_dloss = float("nan")
+        cond_diag_uncond_dloss = float("nan")
+        cond_diag_grad_norm = float("nan")
+        if run_conditioning_diag and conditioning_diag_grad:
+            # Non-leaf tensor; retain_grad is required to inspect conditioning gradient.
+            student_embeds_for_dit.retain_grad()
+
+        if run_conditioning_diag and (conditioning_diag_shuffle or conditioning_diag_uncond):
+            with torch.no_grad():
+                fixed_noise = loss_term.get("noise", None)
+                if isinstance(fixed_noise, torch.Tensor):
+                    fixed_noise = fixed_noise.detach()
+
+                if conditioning_diag_shuffle and b >= 2:
+                    perm = torch.randperm(b, device=device)
+                    if bool(torch.all(perm == torch.arange(b, device=device))):
+                        perm = torch.roll(perm, shifts=1, dims=0)
+                    perm_model_kwargs = {
+                        "y": model_kwargs["y"][perm],
+                        "mask": (model_kwargs["mask"][perm] if isinstance(model_kwargs.get("mask"), torch.Tensor) else model_kwargs.get("mask")),
+                        "data_info": data_info,
+                    }
+                    if chunk_index is not None:
+                        perm_model_kwargs["chunk_index"] = chunk_index
+                    perm_term = sana_train_diffusion.training_losses(
+                        diffusion_model,
+                        latents,
+                        timesteps,
+                        model_kwargs=perm_model_kwargs,
+                        noise=fixed_noise,
+                        timestep_weight=timestep_weight,
+                    )
+                    cond_diag_shuffle_dloss = float((perm_term["loss"].mean() - diff_loss.detach()).item())
+
+                if conditioning_diag_uncond:
+                    uncond_eval_emb, uncond_eval_mask = get_fixed_uncond_batch(
+                        batch_size_local=student_embeds_for_dit.shape[0],
+                        target_len=student_embeds_for_dit.shape[1],
+                        target_dtype=student_embeds_for_dit.dtype,
+                    )
+                    if uncond_eval_emb is None:
+                        uncond_prompts_eval = [cfg_delta_uncond_prompt] * len(prompts_cond)
+                        uncond_eval_emb, uncond_eval_mask = student(uncond_prompts_eval, return_mask=True)
+                        if uncond_eval_emb.dim() == 1:
+                            uncond_eval_emb = uncond_eval_emb.unsqueeze(0).unsqueeze(0)
+                        elif uncond_eval_emb.dim() == 2:
+                            uncond_eval_emb = uncond_eval_emb.unsqueeze(0)
+                    if uncond_eval_emb.dim() == 1:
+                        uncond_eval_emb = uncond_eval_emb.unsqueeze(0).unsqueeze(0)
+                    elif uncond_eval_emb.dim() == 2:
+                        uncond_eval_emb = uncond_eval_emb.unsqueeze(0)
+                    uncond_eval_emb = F.layer_norm(
+                        uncond_eval_emb, (uncond_eval_emb.shape[-1],)
+                    ).to(dtype)
+                    if uncond_eval_mask is None:
+                        uncond_eval_mask = torch.ones(
+                            (uncond_eval_emb.shape[0], uncond_eval_emb.shape[1]),
+                            device=device,
+                            dtype=torch.long,
+                        )
+                    else:
+                        uncond_eval_mask = uncond_eval_mask.to(device=device, dtype=torch.long)
+                        if uncond_eval_mask.dim() == 1:
+                            uncond_eval_mask = uncond_eval_mask.unsqueeze(0)
+                        uncond_eval_mask = pad_or_trim_token_mask(uncond_eval_mask, uncond_eval_emb.shape[1])
+                        if uncond_eval_mask.shape[0] == 1 and uncond_eval_emb.shape[0] > 1:
+                            uncond_eval_mask = uncond_eval_mask.repeat(uncond_eval_emb.shape[0], 1)
+                    uncond_model_kwargs = {
+                        "y": uncond_eval_emb.unsqueeze(1),
+                        "mask": uncond_eval_mask.unsqueeze(1).unsqueeze(1),
+                        "data_info": data_info,
+                    }
+                    if chunk_index is not None:
+                        uncond_model_kwargs["chunk_index"] = chunk_index
+                    uncond_term = sana_train_diffusion.training_losses(
+                        diffusion_model,
+                        latents,
+                        timesteps,
+                        model_kwargs=uncond_model_kwargs,
+                        noise=fixed_noise,
+                        timestep_weight=timestep_weight,
+                    )
+                    cond_diag_uncond_dloss = float((uncond_term["loss"].mean() - diff_loss.detach()).item())
+
         aux_active = (update_step + 1) >= aux_start_step
         distill_mse_loss = torch.tensor(0.0, device=device)
         distill_cos_loss = torch.tensor(0.0, device=device)
@@ -2116,6 +2497,10 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             else:
                 loss.backward()
         bwd_dt = time.time() - fetch_t0 - fetch_dt - student_fwd_dt - dit_fwd_dt
+        if run_conditioning_diag and conditioning_diag_grad:
+            grad_tensor = getattr(student_embeds_for_dit, "grad", None)
+            if grad_tensor is not None:
+                cond_diag_grad_norm = float(grad_tensor.detach().float().norm().item())
         if micro_step == 0:
             logger.info("Rank %s after backward", rank)
 
@@ -2325,10 +2710,11 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 token_norm_mean = student_embeds_for_dit.float().norm(dim=-1).mean().item()
                 gate_raw = float(student_module.adapter_output_gate.detach().float().item())
             log_line = (
-                "Step %d | loss=%.6f diff=%.6f d_mse=%.6f d_cos=%.6f d_pool=%.6f norm=%.6f offdiag_cos=%.4f grad=%.4f "
+                "Step %d | mode=%s loss=%.6f diff=%.6f d_mse=%.6f d_cos=%.6f d_pool=%.6f norm=%.6f offdiag_cos=%.4f grad=%.4f "
                 "emb_mean=%.4f emb_std=%.4f tok_norm=%.4f gate=%.4f cfg_drop=%.3f"
             ) % (
                 update_step,
+                active_batch_modality,
                 loss.item() * grad_accum_steps,
                 diff_loss.item(),
                 distill_mse_loss.item(),
@@ -2343,6 +2729,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 gate_raw,
                 (float(dropped_prompts) / float(max(1, len(prompts_cond)))),
             )
+            if joint_enabled:
+                log_line += " v_micro=%d i_micro=%d" % (video_micro_count, image_micro_count)
             if log_lora_grad:
                 log_line += (
                     " loraA=%d/%d:%.6f loraB=%d/%d:%.6f"
@@ -2363,6 +2751,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     cfg_cond_ctx_norm,
                     cfg_uncond_ctx_norm,
                 )
+            if not math.isnan(cond_diag_shuffle_dloss):
+                log_line += " cond_shuffle_dloss=%.6f" % cond_diag_shuffle_dloss
+            if not math.isnan(cond_diag_uncond_dloss):
+                log_line += " cond_uncond_dloss=%.6f" % cond_diag_uncond_dloss
+            if not math.isnan(cond_diag_grad_norm):
+                log_line += " cond_grad=%.6f" % cond_diag_grad_norm
             if semantic_enabled:
                 log_line += " sem_var=%.6f sem_cov=%.6f sem_geom=%.6f" % (
                     semantic_var_loss.item(),
