@@ -1,8 +1,8 @@
 run:
   seed: 1234
-  output_dir: output/stage1_teacher_free_msrvtt_sana_nochunk_nochi_anticollapse
+  output_dir: output/stage1_teacher_free_joint_msrvtt_laion_coyo_ivjoint
   log_every: 20
-  save_every_steps: 200
+  save_every_steps: 1000
   num_workers: 0
   precision: bf16
   auto_download_pretrained: true
@@ -27,6 +27,10 @@ run:
   cfg_uncond_fixed_eval: true
   strict_sana_parity_text_path: true
   strict_fail_fast_mask: true
+  conditioning_diag_every_steps: 100
+  conditioning_diag_shuffle: true
+  conditioning_diag_uncond: true
+  conditioning_diag_grad: true
   debug_probe_prompts:
   - a cat playing with a wool beside a fireside
   - a fox running through a snowy forest at sunrise
@@ -58,7 +62,7 @@ model:
     resampler_mlp_mult: 2
     gate_min_value: 0.0
     lora:
-      enable: false
+      enable: true
       r: 16
       alpha: 32
       dropout: 0.05
@@ -100,11 +104,18 @@ sana:
     num_train_timesteps: 1000
 data:
   openvid:
-    csv_path: data/msrvtt/OpenVid_extracted_subset_unique.csv
-    video_dir: data/msrvtt/videos
-    preprocessed_dir: data/msrvtt/preprocessed
+    csv_path: data/mix/manifests/joint_msrvtt_coyo_laion_recovered_ivjoint_clean_v4_20260226.csv
+    video_dir: .
+    preprocessed_dir: null
     use_preprocessed: true
     max_samples: null
+  joint:
+    enabled: true
+    image_per_video: 5
+    interval: 0
+    video_modality: video
+    image_modality: image
+    image_max_samples: null
   preprocessing:
     normalize_whitespace: true
     strip: true
@@ -121,6 +132,7 @@ data:
   - 'A cinematic video of {prompt}. motion score: {motion_score}.'
   batching:
     batch_size: 1
+    batch_size_image: 1
     grad_accum_steps: 1
     shuffle: true
     drop_last: true
@@ -162,8 +174,8 @@ loss:
       preload: false
       max_cached_shards: 2
   semantic_probe:
-    enabled: true
-    weight: 0.2
+    enabled: false
+    weight: 0.0
     var_weight: 1.0
     cov_weight: 0.05
     geom_weight: 1.0

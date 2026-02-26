@@ -622,7 +622,16 @@ def log_trainable_signature(
     )
 
 
-def build_student(cfg: AttrDict, device: torch.device, dtype: torch.dtype) -> SanaPromptBridge:
+def build_student(
+    cfg: AttrDict,
+    device: torch.device,
+    dtype: torch.dtype,
+    *,
+    strict_sana_parity_text_path: bool = False,
+    strict_fail_fast_mask: bool = False,
+    sana_model_max_length: int = 300,
+    sana_chi_prompt_text: str = "",
+) -> SanaPromptBridge:
     # Build prompt bridge + optional LoRA on top of SmolVLM2 backbone.
     student_cfg = cfg.model.student
     bridge_cfg = student_cfg.conditioner_bridge
@@ -660,6 +669,10 @@ def build_student(cfg: AttrDict, device: torch.device, dtype: torch.dtype) -> Sa
         mcp_use_refine=student_cfg.get("projector", {}).get("mcp_use_refine", True),
         mcp_refine_kernel_size=student_cfg.get("projector", {}).get("mcp_refine_kernel_size", 3),
         mcp_fusion_temperature=student_cfg.get("projector", {}).get("mcp_fusion_temperature", 1.0),
+        strict_sana_parity_text_path=bool(strict_sana_parity_text_path),
+        fail_fast_mask=bool(strict_fail_fast_mask),
+        sana_model_max_length=int(sana_model_max_length),
+        sana_chi_prompt=sana_chi_prompt_text,
     )
 
     # Ensure consistent trainable flags across ranks, then freeze the text tower
@@ -951,6 +964,16 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             if is_main:
                 logger.info("Using SANA chi_prompt prefix (len=%d chars)", len(chi_prompt_text))
 
+    strict_sana_parity_text_path = bool(getattr(cfg.run, "strict_sana_parity_text_path", False))
+    strict_fail_fast_mask = bool(getattr(cfg.run, "strict_fail_fast_mask", strict_sana_parity_text_path))
+    sana_model_max_length = int(getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "model_max_length", 300) or 300)
+    if is_main and strict_sana_parity_text_path:
+        logger.info(
+            "Strict SANA-parity text path enabled: model_max_length=%d fail_fast_mask=%s",
+            sana_model_max_length,
+            strict_fail_fast_mask,
+        )
+
     dit_fsdp_cfg = cfg.model.dit.get("fsdp")
     use_fsdp = bool(getattr(sana_cfg, "use_fsdp", False)) if dit_fsdp_cfg is None else bool(dit_fsdp_cfg)
     use_dit_ddp = bool(cfg.model.dit.get("ddp", False))
@@ -1075,7 +1098,15 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     elif world_size > 1:
         logger.info("Rank %s using manual gradient all-reduce for DiT (FSDP/DDP disabled)", rank)
 
-    student = build_student(cfg, device, dtype)
+    student = build_student(
+        cfg,
+        device,
+        dtype,
+        strict_sana_parity_text_path=strict_sana_parity_text_path,
+        strict_fail_fast_mask=strict_fail_fast_mask,
+        sana_model_max_length=sana_model_max_length,
+        sana_chi_prompt_text=chi_prompt_text,
+    )
     student.to(device)
     if is_main:
         logger.info("Built student model")
@@ -1815,6 +1846,10 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         "train_use_prompt_templates": bool(use_prompt_templates_cfg),
         "train_motion_score": int(cfg.data.get("motion_score", 10)),
         "train_prompt_templates": [str(t) for t in list(prompt_templates_cfg)],
+        "strict_sana_parity_text_path": bool(strict_sana_parity_text_path),
+        "strict_fail_fast_mask": bool(strict_fail_fast_mask),
+        "sana_model_max_length": int(sana_model_max_length),
+        "train_student_max_length": int(getattr(cfg.model.student.text_encoder, "max_length", 0) or 0),
         "train_chunk_index": (list(chunk_index) if chunk_index is not None else None),
         "train_chunk_sampling_strategy": str(chunk_sampling_strategy),
         "train_same_timestep_prob": float(same_timestep_prob),
@@ -2114,10 +2149,20 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
 
         # Use prompt mask from student tokenizer/bridge (important for variable-length prompts).
         if student_prompt_mask is None:
+            if strict_fail_fast_mask:
+                raise RuntimeError(
+                    "Strict fail-fast mask enabled: student returned None prompt mask. "
+                    "Check tokenizer/bridge output parity."
+                )
             mask = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)
         else:
             mask = student_prompt_mask.to(device=device, dtype=torch.long)
             if mask.shape[:2] != student_embeds_for_dit.shape[:2]:
+                if strict_fail_fast_mask:
+                    raise RuntimeError(
+                        "Strict fail-fast mask enabled: prompt mask shape mismatch "
+                        f"mask={tuple(mask.shape)} embeds={tuple(student_embeds_for_dit.shape)}"
+                    )
                 # TODO(cleanup): remove this silent fallback once mask pipeline is stable.
                 # Keeping all-ones here can hide conditioning-mask bugs during triage.
                 mask = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)

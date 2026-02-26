@@ -275,6 +275,10 @@ class SanaPromptBridge(nn.Module):
         mcp_use_refine: bool = True,
         mcp_refine_kernel_size: int = 3,
         mcp_fusion_temperature: float = 1.0,
+        strict_sana_parity_text_path: bool = False,
+        fail_fast_mask: Optional[bool] = None,
+        sana_model_max_length: int = 300,
+        sana_chi_prompt: str = "",
     ):
         super().__init__()
 
@@ -288,6 +292,13 @@ class SanaPromptBridge(nn.Module):
         self.gate_min_value = float(gate_min_value)
         self.projector_type = str(projector_type or "legacy").lower()
         self.mcp_fusion_temperature = float(mcp_fusion_temperature)
+        self.strict_sana_parity_text_path = bool(strict_sana_parity_text_path)
+        self.fail_fast_mask = bool(
+            self.strict_sana_parity_text_path if fail_fast_mask is None else fail_fast_mask
+        )
+        self.sana_model_max_length = int(sana_model_max_length)
+        self.sana_chi_prompt = str(sana_chi_prompt or "")
+        self._chi_prompt_token_count = None
 
         self.smolvlm2_model = load_smolvlm2_from_ckpt(
             smolvlm2_ckpt_path,
@@ -575,12 +586,31 @@ class SanaPromptBridge(nn.Module):
             p if p is not None and str(p).strip() else (tokenizer.eos_token or tokenizer.pad_token or " ")
             for p in prompts
         ]
+        tokenize_max_length = int(self.max_length)
+        tokenize_padding = True
+        if self.strict_sana_parity_text_path:
+            if self.sana_model_max_length < 1:
+                raise RuntimeError(f"Invalid sana_model_max_length={self.sana_model_max_length}")
+            has_chi_prefix = bool(self.sana_chi_prompt) and all(str(p).startswith(self.sana_chi_prompt) for p in prompts)
+            if has_chi_prefix:
+                if self._chi_prompt_token_count is None:
+                    self._chi_prompt_token_count = len(tokenizer.encode(self.sana_chi_prompt))
+                tokenize_max_length = int(self._chi_prompt_token_count + self.sana_model_max_length - 2)
+                tokenize_max_length = max(tokenize_max_length, self.sana_model_max_length)
+            else:
+                tokenize_max_length = int(self.sana_model_max_length)
+            if tokenize_max_length > int(self.max_length):
+                raise RuntimeError(
+                    "Strict SANA-parity requires max_length >= tokenize_max_length, "
+                    f"got max_length={self.max_length}, tokenize_max_length={tokenize_max_length}"
+                )
+            tokenize_padding = "max_length"
         inputs = tokenizer(
             prompts,
             return_tensors="pt",
-            padding=True,
+            padding=tokenize_padding,
             truncation=True,
-            max_length=self.max_length,
+            max_length=tokenize_max_length,
         )
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs.get("attention_mask", None)
@@ -621,6 +651,28 @@ class SanaPromptBridge(nn.Module):
         if return_all_hidden_states and hasattr(outputs, "hidden_states") and isinstance(outputs.hidden_states, (list, tuple)):
             # Drop embedding output if present by keeping only tensors with same ndim as token hidden states.
             all_hidden_states = [h for h in outputs.hidden_states if isinstance(h, torch.Tensor) and h.dim() == 3]
+        if self.strict_sana_parity_text_path:
+            target_len = int(self.sana_model_max_length)
+            cur_len = int(hidden_states.shape[1])
+            if cur_len < target_len:
+                raise RuntimeError(
+                    f"Strict SANA-parity requires hidden length >= {target_len}, got {cur_len}."
+                )
+            if cur_len != target_len:
+                tail_len = target_len - 1
+                tail_start = cur_len - tail_len
+                select_index = torch.cat(
+                    [
+                        torch.tensor([0], device=hidden_states.device, dtype=torch.long),
+                        torch.arange(tail_start, cur_len, device=hidden_states.device, dtype=torch.long),
+                    ],
+                    dim=0,
+                )
+                hidden_states = hidden_states.index_select(1, select_index)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.index_select(1, select_index.to(attention_mask.device))
+                if all_hidden_states is not None:
+                    all_hidden_states = [h.index_select(1, select_index.to(h.device)) for h in all_hidden_states]
         if return_mask:
             return hidden_states, attention_mask, all_hidden_states
         return hidden_states, None, all_hidden_states
@@ -665,6 +717,12 @@ class SanaPromptBridge(nn.Module):
                     attention_mask = attention_mask.unsqueeze(0)
                 prompt_mask = attention_mask.to(device=prompt_embeds.device, dtype=torch.long)
             else:
+                if self.fail_fast_mask:
+                    raise RuntimeError(
+                        "Fail-fast mask enabled: attention_mask/prompt_embeds shape mismatch: "
+                        f"attention_mask={tuple(attention_mask.shape) if attention_mask is not None else None}, "
+                        f"prompt_embeds={tuple(prompt_embeds.shape)}"
+                    )
                 # TODO(cleanup): tighten this fallback to an explicit error in strict parity mode.
                 # All-ones mask is robust for runtime, but can hide token-length/mask mismatches.
                 if not hasattr(self, "_mask_mismatch_warned"):
