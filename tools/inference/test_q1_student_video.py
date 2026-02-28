@@ -130,6 +130,7 @@ def main():
         model_dtype=dtype,
         vae_dtype=vae_dtype,
         latent_size=latent_size,
+        load_text_encoder=False,
     )
 
     # Prepare prompt canonical text (AR-normalized like SANA).
@@ -471,20 +472,48 @@ def main():
     num_frames = int(args.num_frames)
     target_latent_t = int(args.latent_frames) if args.latent_frames is not None else None
     if target_latent_t is None and num_frames == default_num_frames:
+        # Prefer raw/train latent T for generation-time temporal setup.
+        # train_effective_latent_t may reflect train-only latent windowing.
         hinted_effective_t = infer_hints.get("train_effective_latent_t", None)
-        if hinted_effective_t is None:
-            hinted_effective_t = infer_hints.get("train_latent_t", None)
-        if hinted_effective_t is None:
-            hinted_effective_t = infer_hints.get("train_expected_latent_t", None)
+        hinted_train_t = infer_hints.get("train_latent_t", None)
+        hinted_expected_t = infer_hints.get("train_expected_latent_t", None)
+        hinted_chunk_index = infer_hints.get("train_chunk_index", None)
+        hinted_use_process = bool(infer_hints.get("train_use_process_timesteps", False))
         hinted_frame_num = infer_hints.get("train_frame_num", None)
         if hinted_frame_num is None:
             hinted_frame_num = infer_hints.get("train_expected_frame_num", None)
-        if hinted_effective_t is not None:
+        try:
+            _train_t_int = int(hinted_train_t) if hinted_train_t is not None else None
+            _eff_t_int = int(hinted_effective_t) if hinted_effective_t is not None else None
+            if (
+                _train_t_int is not None
+                and _eff_t_int is not None
+                and _train_t_int != _eff_t_int
+                and hinted_chunk_index in (None, "None")
+                and not hinted_use_process
+            ):
+                print(
+                    "WARNING: checkpoint reports train_latent_t="
+                    f"{_train_t_int} but train_effective_latent_t={_eff_t_int} "
+                    "(train-time latent windowing). "
+                    f"Use --latent_frames {_eff_t_int} for strict parity with this checkpoint."
+                )
+        except Exception:
+            pass
+        hinted_auto_t = hinted_train_t
+        hinted_auto_t_src = "train_latent_t"
+        if hinted_auto_t is None:
+            hinted_auto_t = hinted_expected_t
+            hinted_auto_t_src = "train_expected_latent_t"
+        if hinted_auto_t is None:
+            hinted_auto_t = hinted_effective_t
+            hinted_auto_t_src = "train_effective_latent_t"
+        if hinted_auto_t is not None:
             try:
-                target_latent_t = max(1, int(hinted_effective_t))
+                target_latent_t = max(1, int(hinted_auto_t))
                 print(
                     "Temporal auto-match from checkpoint: "
-                    f"train_effective_latent_t={target_latent_t}"
+                    f"{hinted_auto_t_src}={target_latent_t}"
                 )
             except Exception:
                 target_latent_t = None

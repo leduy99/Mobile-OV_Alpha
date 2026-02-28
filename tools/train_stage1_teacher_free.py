@@ -195,13 +195,23 @@ def ensure_sana_assets_available(
         if not os.path.exists(local_path):
             missing_by_repo.setdefault(repo_id, []).append(rel_path)
 
+    needs_download_local = bool(missing_by_repo)
+
     if missing_by_repo and is_main:
         logger.info("SANA checkpoints missing, auto-downloading to %s ...", sana_ckpt_dir)
         for repo_id, rels in missing_by_repo.items():
             logger.info("Downloading from %s: %s", repo_id, rels)
             download_hf_files(repo_id=repo_id, rel_paths=rels, local_dir=sana_ckpt_dir)
 
-    safe_barrier(local_rank)
+    # Avoid early NCCL barrier when nothing needs to be downloaded.
+    # Some clusters can intermittently hang on very-early barriers.
+    needs_download_global = needs_download_local
+    if dist.is_initialized():
+        flag = torch.tensor([1 if needs_download_local else 0], device=f"cuda:{local_rank}", dtype=torch.int32)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        needs_download_global = bool(int(flag.item()))
+    if needs_download_global:
+        safe_barrier(local_rank)
 
     for local_path in required_local:
         if not os.path.exists(local_path):
@@ -219,7 +229,6 @@ def ensure_smolvlm2_checkpoint_available(
     Ensure converted SmolVLM2 checkpoint exists; auto-convert from HF when missing.
     """
     if os.path.exists(ckpt_path):
-        safe_barrier(local_rank)
         return
 
     if is_main:
@@ -244,7 +253,8 @@ def ensure_smolvlm2_checkpoint_available(
         logger.info("Running: %s", " ".join(cmd))
         subprocess.run(cmd, check=True)
 
-    safe_barrier(local_rank)
+    if dist.is_initialized():
+        safe_barrier(local_rank)
 
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(
@@ -941,20 +951,34 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     auto_download_sana = bool(getattr(cfg.run, "auto_download_sana", auto_download_pretrained))
     auto_download_smol = bool(getattr(cfg.run, "auto_download_smolvlm2", auto_download_pretrained))
     smol_ckpt_path = str(cfg.model.student.text_encoder.ckpt_path)
+    if is_main:
+        logger.info(
+            "Bootstrap stage: loaded config, auto_download_sana=%s auto_download_smol=%s",
+            auto_download_sana,
+            auto_download_smol,
+        )
 
     if auto_download_sana:
+        if is_main:
+            logger.info("Bootstrap stage: ensure_sana_assets_available (start)")
         ensure_sana_assets_available(
             sana_cfg=sana_cfg,
             sana_ckpt_dir=sana_ckpt_dir,
             is_main=is_main,
             local_rank=local_rank,
         )
+        if is_main:
+            logger.info("Bootstrap stage: ensure_sana_assets_available (done)")
     if auto_download_smol:
+        if is_main:
+            logger.info("Bootstrap stage: ensure_smolvlm2_checkpoint_available (start)")
         ensure_smolvlm2_checkpoint_available(
             ckpt_path=smol_ckpt_path,
             is_main=is_main,
             local_rank=local_rank,
         )
+        if is_main:
+            logger.info("Bootstrap stage: ensure_smolvlm2_checkpoint_available (done)")
 
     chi_prompt_text = ""
     if bool(getattr(cfg.data.get("preprocessing", AttrDict()), "use_chi_prompt", False)):
@@ -983,12 +1007,21 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     # FSDP init is more stable if all ranks load identical weights locally.
     # We therefore avoid rank0-only checkpoint loading and disable state sync.
     skip_ckpt_load = False
+    sana_train_cfg = getattr(sana_cfg, "train", AttrDict())
+    # Match upstream SANA: grad-checkpointing must be wired at model-build time.
+    # Fallback to run.gradient_checkpointing for backward compatibility.
+    use_sana_model_grad_ckpt = bool(
+        getattr(sana_train_cfg, "grad_checkpointing", getattr(cfg.run, "gradient_checkpointing", False))
+    )
+    sana_gc_step = int(getattr(sana_train_cfg, "gc_step", 1) or 1)
     diffusion_model = load_sana_diffusion_model(
         sana_cfg=sana_cfg,
         sana_ckpt_dir=sana_ckpt_dir,
         device=device,
         dtype=dtype,
         skip_ckpt_load=skip_ckpt_load,
+        use_grad_checkpoint=use_sana_model_grad_ckpt,
+        grad_checkpoint_step=sana_gc_step,
     )
     diffusion_model.to(device)
     if is_main:
@@ -1069,15 +1102,32 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     student_ddp_find_unused = bool(getattr(cfg.run, "student_ddp_find_unused_parameters", False))
 
     if use_fsdp and world_size > 1:
+        sharding_name = str(cfg.model.dit.get("fsdp_sharding_strategy", "shard_grad_op") or "shard_grad_op").lower()
+        sharding_map = {
+            "full_shard": ShardingStrategy.FULL_SHARD,
+            "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
+            "no_shard": ShardingStrategy.NO_SHARD,
+            "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
+            "_hybrid_shard_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
+        }
+        if sharding_name not in sharding_map:
+            raise RuntimeError(
+                "Invalid model.dit.fsdp_sharding_strategy=%r; valid values are: %s"
+                % (sharding_name, ", ".join(sorted(sharding_map.keys())))
+            )
+        dit_sharding_strategy = sharding_map[sharding_name]
         # FSDP for DiT: shard trainable params/gradients across ranks.
         if is_main:
-            logger.info("Wrapping DiT with FSDP (use_orig_params=True, sync_module_states=False)")
+            logger.info(
+                "Wrapping DiT with FSDP (use_orig_params=True, sync_module_states=False, sharding=%s)",
+                sharding_name,
+            )
         diffusion_model = FSDP(
             diffusion_model,
             use_orig_params=True,
             device_id=device,
             sync_module_states=False,
-            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            sharding_strategy=dit_sharding_strategy,
             limit_all_gathers=True,
         )
         # After FSDP wrapping, rebuild the param list for the optimizer.
@@ -1624,6 +1674,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     manual_sync_backend = str(getattr(cfg.run, "manual_sync_backend", "nccl") or "nccl").lower()
     student_sync = bool(getattr(cfg.run, "student_sync", True))
     dit_sync = bool(getattr(cfg.run, "dit_sync", True))
+    require_dit_sharding = bool(getattr(cfg.run, "require_dit_sharding", False))
     use_barrier = bool(getattr(cfg.run, "use_barrier", False))
     gate_min_value = float(cfg.model.student.get("gate_min_value", 0.0))
     gate_loss_cfg = cfg.loss.get("gate", AttrDict())
@@ -1755,6 +1806,26 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 logger.info("Manual gradient sync backend: gloo")
         elif is_main:
             logger.info("Manual gradient sync backend: nccl")
+
+        dit_is_wrapped = bool(use_fsdp or use_dit_ddp or use_dit_deepspeed)
+        allow_manual_dit_sync = bool(getattr(cfg.run, "allow_manual_dit_sync", False))
+        if not dit_is_wrapped:
+            msg = (
+                "DiT is not wrapped by FSDP/DDP/DeepSpeed in multi-GPU mode "
+                "(model.dit.fsdp/model.dit.ddp/model.dit.deepspeed are effectively disabled). "
+                "This would fallback to manual DiT gradient all-reduce, which is memory-heavy and easy to OOM."
+            )
+            # Default behavior is fail-fast: require explicit override for manual DiT sync fallback.
+            if require_dit_sharding or (not allow_manual_dit_sync):
+                raise RuntimeError(
+                    f"{msg} Set model.dit.fsdp=true (recommended), or explicitly set "
+                    "run.allow_manual_dit_sync=true only for debug."
+                )
+            if is_main:
+                logger.warning(
+                    "%s Manual DiT sync fallback is explicitly allowed by run.allow_manual_dit_sync=true.",
+                    msg,
+                )
 
         manual_sync_mode = (
             (not use_fsdp)
@@ -2212,10 +2283,32 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             logger.info("Latent shape %s dtype=%s", tuple(latents.shape), latents.dtype)
 
         # Optional temporal/spatial windowing to reduce activation memory.
+        # NOTE: For SANA chunk-causal parity, do not combine train-time latent windowing
+        # with chunk-aware/frame-aware timestep sampling. Keep full latent T and use
+        # chunk_index + process_timesteps to model temporal chunks.
         window_cfg = cfg.train.get("latent_window", AttrDict())
         win_frames = getattr(window_cfg, "frames", None)
         win_h = getattr(window_cfg, "height", None)
         win_w = getattr(window_cfg, "width", None)
+        if win_frames and (chunk_index is not None or use_sana_process_timesteps):
+            strict_chunk_parity = bool(getattr(cfg.train, "strict_chunk_parity", True))
+            msg = (
+                "train.latent_window.frames is enabled while chunk-aware training is active "
+                f"(chunk_index={chunk_index}, use_process_timesteps={use_sana_process_timesteps}). "
+                "Temporal windowing changes effective latent T and breaks SANA chunk-causal parity."
+            )
+            if strict_chunk_parity:
+                raise RuntimeError(msg)
+            if is_main and micro_step == 0:
+                logger.warning("%s (strict_chunk_parity=false: continuing anyway)", msg)
+        if (win_h or win_w) and (chunk_index is not None or use_sana_process_timesteps):
+            # Spatial-only windowing keeps latent T unchanged (chunk/timestep semantics stay temporal-parity),
+            # but it still changes spatial AR distribution versus upstream full-resolution training.
+            if is_main and micro_step == 0:
+                logger.warning(
+                    "train.latent_window.{height,width} is enabled with chunk-aware training. "
+                    "Temporal chunk parity is preserved (T unchanged), but spatial AR parity is not."
+                )
         if win_frames or win_h or win_w:
             _, _, t_total, h_total, w_total = latents.shape
             t_win = int(win_frames) if win_frames else t_total
@@ -2249,6 +2342,15 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 latents = latents_btchw.view(b0, t0, c0, new_h, new_w).permute(0, 2, 1, 3, 4).contiguous()
 
         b, c, t, h, w = latents.shape
+        if chunk_index is not None:
+            # Chunk starts must be valid indices in [0, t-1], with 0 included.
+            if len(chunk_index) == 0 or int(chunk_index[0]) != 0:
+                raise RuntimeError(f"Invalid chunk_index={chunk_index}: must start at 0.")
+            if int(chunk_index[-1]) >= int(t):
+                raise RuntimeError(
+                    f"Invalid chunk_index={chunk_index} for latent_t={t}: "
+                    "last chunk start must be < latent_t."
+                )
         if observed_train_effective_latent_t is None:
             observed_train_effective_latent_t = int(t)
             infer_hints["train_effective_latent_t"] = int(observed_train_effective_latent_t)
@@ -2906,6 +3008,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             student_state = build_student_checkpoint_state(student, student_module)
             dit_state = get_trainable_dit_state_dict(diffusion_model)
             if is_main:
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                 torch.save(
                     {
                         "step": update_step,
@@ -2937,6 +3040,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     dit_state = get_trainable_dit_state_dict(diffusion_model)
     if is_main:
         final_ckpt_path = os.path.join(run_dir, "checkpoint_final.pt")
+        os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
         torch.save(
             {
                 "step": update_step,
@@ -2959,6 +3063,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             final_ckpt_path,
         )
         logger.info("Saved final checkpoint: %s", final_ckpt_path)
+        os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "train_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
 
