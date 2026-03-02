@@ -10,7 +10,11 @@ import random
 from nets.third_party.wan.modules.model import WanModel
 from nets.omni.modules.adapter import DM_Adapter
 from nets.omni.modules.visual_context_adapter import VisualContextAdapter
-from nets.third_party.llava.model.vila_with_vision_head import VisionHead
+# Lazy import VisionHead to avoid llava package dependency when using MobileOVModel
+try:
+    from nets.third_party.llava.model.vila_with_vision_head import VisionHead
+except (ImportError, ModuleNotFoundError):
+    VisionHead = None  # Will be None if llava package is not available
 
 class OmniVideoMixedConditionModel(nn.Module):
     """    
@@ -85,10 +89,14 @@ class OmniVideoMixedConditionModel(nn.Module):
         
         
         # AR Vision Head
-        self.ar_vision_head = VisionHead(llm_hidden_size = llm_hidden_size, learnable_query_length=learnable_query_length)
-        if vision_head_or_ckpt_dir is not None and os.path.exists(vision_head_or_ckpt_dir):
-            logging.info(f"Loading AR Vision Head from {vision_head_or_ckpt_dir}")
-            self.ar_vision_head.load_checkpoint(vision_head_or_ckpt_dir)
+        if VisionHead is not None:
+            self.ar_vision_head = VisionHead(llm_hidden_size = llm_hidden_size, learnable_query_length=learnable_query_length)
+            if vision_head_or_ckpt_dir is not None and os.path.exists(vision_head_or_ckpt_dir):
+                logging.info(f"Loading AR Vision Head from {vision_head_or_ckpt_dir}")
+                self.ar_vision_head.load_checkpoint(vision_head_or_ckpt_dir)
+        else:
+            logging.warning("VisionHead not available (llava package not installed), AR vision head will be None")
+            self.ar_vision_head = None
        
 
         # Visual Context Adapter
@@ -303,12 +311,20 @@ class OmniVideoMixedConditionModel(nn.Module):
                     if isinstance(adapter_output, list):
                         if adapter_output[idx].dim() == 3:
                             adapter_item = adapter_output[idx][0]
+                            if idx == 0:
+                                print(f"[DEBUG OmniVideo] adapter_output[{idx}] shape: {adapter_output[idx].shape}, taking [0] -> {adapter_item.shape}", flush=True)
                         else:
                             adapter_item = adapter_output[idx]
+                            if idx == 0:
+                                print(f"[DEBUG OmniVideo] adapter_output[{idx}] shape: {adapter_output[idx].shape} (2D)", flush=True)
                     elif adapter_output.dim() == 3:
                         adapter_item = adapter_output[idx]
+                        if idx == 0:
+                            print(f"[DEBUG OmniVideo] adapter_output shape: {adapter_output.shape}, taking [{idx}] -> {adapter_item.shape}", flush=True)
                     else:
                         adapter_item = adapter_output
+                        if idx == 0:
+                            print(f"[DEBUG OmniVideo] adapter_output shape: {adapter_output.shape} (2D)", flush=True)
                 
                 # Get context item if available
                 context_item = None
@@ -395,24 +411,56 @@ class OmniVideoMixedConditionModel(nn.Module):
                     items_to_concat = []
                     
                     # Add all available components in a logical order
+                    # CRITICAL: Ensure all items are 2D [L, C] before concatenating
                     if visual_item is not None:
+                        # Ensure visual_item is 2D [L, C]
+                        if visual_item.dim() > 2:
+                            visual_item = visual_item.view(-1, visual_item.shape[-1])  # Flatten to 2D
+                        elif visual_item.dim() == 1:
+                            visual_item = visual_item.unsqueeze(0)  # [C] -> [1, C]
                         items_to_concat.append(visual_item)
                     
                     if ref_item is not None:
+                        # Ensure ref_item is 2D [L, C]
+                        if ref_item.dim() > 2:
+                            ref_item = ref_item.view(-1, ref_item.shape[-1])  # Flatten to 2D
+                        elif ref_item.dim() == 1:
+                            ref_item = ref_item.unsqueeze(0)  # [C] -> [1, C]
                         items_to_concat.append(ref_item)
                     
                     if adapter_item is not None:
+                        # Ensure adapter_item is 2D [L, C]
+                        if adapter_item.dim() > 2:
+                            adapter_item = adapter_item.view(-1, adapter_item.shape[-1])  # Flatten to 2D
+                        elif adapter_item.dim() == 1:
+                            adapter_item = adapter_item.unsqueeze(0)  # [C] -> [1, C]
                         items_to_concat.append(adapter_item)
                     
                     if context_item is not None:
+                        # Ensure context_item is 2D [L, C]
+                        if context_item.dim() > 2:
+                            context_item = context_item.view(-1, context_item.shape[-1])  # Flatten to 2D
+                        elif context_item.dim() == 1:
+                            context_item = context_item.unsqueeze(0)  # [C] -> [1, C]
                         items_to_concat.append(context_item)
                     
                     if items_to_concat:
+                        # PROFILE: Log context sizes before concatenation
+                        if idx == 0:
+                            shapes_str = ", ".join([f"item{i}: {item.shape}" for i, item in enumerate(items_to_concat)])
+                            print(f"[PROFILE OmniVideo] Before concat - {shapes_str}", flush=True)
                         new_context = torch.cat(items_to_concat, dim=0)
+                        if idx == 0:
+                            print(f"[DEBUG OmniVideo] Mixed context shape: {new_context.shape} (before truncate)", flush=True)
                         
                         # Truncate if needed
                         if self.max_context_len is not None and new_context.shape[0] > self.max_context_len:
+                            old_len = new_context.shape[0]
                             new_context = new_context[0: self.max_context_len]
+                            if idx == 0:
+                                print(f"[DEBUG OmniVideo] Truncated context: {old_len} -> {new_context.shape[0]} tokens", flush=True)
+                        if idx == 0:
+                            print(f"[DEBUG OmniVideo] Final context shape: {new_context.shape}", flush=True)
                     else:
                         # If no components were added (should never happen)
                         raise ValueError("No components available to create context")
@@ -423,7 +471,27 @@ class OmniVideoMixedConditionModel(nn.Module):
             raise ValueError(f"Condition mode {condition_mode} is not supported")
         
         # Forward through WanModel with the enhanced context
-        return self.wan_model(x, t=t, context=mixed_context, seq_len=seq_len)
+        # PROFILE: WAN forward pass
+        if len(mixed_context) > 0:
+            print(f"[DEBUG OmniVideo] WAN context input shape: {mixed_context[0].shape}", flush=True)
+        import time as time_module
+        wan_start = time_module.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        result = self.wan_model(x, t=t, context=mixed_context, seq_len=seq_len)
+        
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        wan_time = time_module.time() - wan_start
+        
+        # PROFILE: Log timing and context info
+        print(f"[PROFILE OmniVideo] WAN forward pass: {wan_time*1000:.2f}ms", flush=True)
+        if mixed_context and len(mixed_context) > 0:
+            ctx_shape = mixed_context[0].shape if isinstance(mixed_context[0], torch.Tensor) else "N/A"
+            print(f"[PROFILE OmniVideo] Context shape: {ctx_shape}, Context length: {ctx_shape[0] if isinstance(ctx_shape, tuple) and len(ctx_shape) > 0 else 'N/A'}", flush=True)
+        
+        return result
     
     def save_pretrained(self, save_dir: str):
         """

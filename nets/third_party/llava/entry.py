@@ -3,8 +3,14 @@ from typing import Optional
 
 from transformers import PreTrainedModel
 
-from llava.mm_utils import get_model_name_from_path
-from llava.model.builder import load_pretrained_model
+# Import from local module instead of external package
+try:
+    from .mm_utils import get_model_name_from_path
+    from .model.builder import load_pretrained_model
+except ImportError:
+    # Fallback to external package if local import fails
+    from llava.mm_utils import get_model_name_from_path
+    from llava.model.builder import load_pretrained_model
 
 __all__ = ["load"]
 

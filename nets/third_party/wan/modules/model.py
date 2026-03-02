@@ -8,7 +8,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
-from .attention import flash_attention
+from .attention import flash_attention, attention
 
 __all__ = ['WanModel']
 
@@ -144,7 +144,8 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
-        x = flash_attention(
+        # Use attention() instead of flash_attention() to support fallback when flash_attn is not available
+        x = attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
@@ -174,7 +175,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -214,9 +215,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-        img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        img_x = attention(q, k_img, v_img, k_lens=None)
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = attention(q, k, v, k_lens=context_lens)
 
         # output
         x = x.flatten(2)
@@ -492,6 +493,7 @@ class WanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        context_lens=None,  # FIX: Allow passing context_lens from outside for proper attention masking
     ):
         r"""
         Forward pass through the diffusion model
@@ -544,7 +546,14 @@ class WanModel(ModelMixin, ConfigMixin):
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
-        context_lens = None
+        # FIX: Use provided context_lens if available, otherwise calculate from context
+        if context_lens is None:
+            # Calculate context_lens from context shapes if not provided
+            if isinstance(context, list):
+                context_lens = torch.tensor([ctx.shape[0] for ctx in context], dtype=torch.long, device=context[0].device)
+            else:
+                # Fallback: assume full context length
+                context_lens = None
         context = self.text_embedding(
             torch.stack([
                 torch.cat(

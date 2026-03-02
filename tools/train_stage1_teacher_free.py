@@ -1697,6 +1697,13 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     conditioning_diag_shuffle = bool(getattr(cfg.run, "conditioning_diag_shuffle", True))
     conditioning_diag_uncond = bool(getattr(cfg.run, "conditioning_diag_uncond", True))
     conditioning_diag_grad = bool(getattr(cfg.run, "conditioning_diag_grad", True))
+    conditioning_shape_log = bool(getattr(cfg.run, "conditioning_shape_log", True))
+    conditioning_pred_probe_every = int(getattr(cfg.run, "conditioning_pred_probe_every_steps", 0) or 0)
+    conditioning_pred_probe_prompts = list(getattr(cfg.run, "conditioning_pred_probe_prompts", []) or [])
+    if len(conditioning_pred_probe_prompts) < 2:
+        conditioning_pred_probe_prompts = list(debug_probe_prompts[:2]) if len(debug_probe_prompts) >= 2 else []
+    probe_only = bool(getattr(cfg.run, "probe_only", False))
+    probe_only_steps = int(getattr(cfg.run, "probe_only_steps", 1) or 1)
     distill_cfg = cfg.loss.get("distill", AttrDict())
     distill_enabled = bool(getattr(distill_cfg, "enabled", False))
     distill_teacher_store = None
@@ -2000,12 +2007,22 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 )
 
         sharded_resume_mode = isinstance(student, FSDP) or isinstance(diffusion_model, FSDP) or bool(use_dit_deepspeed)
-        if sharded_resume_mode:
+        skip_resume_optim_state = bool(
+            getattr(args, "resume_skip_optimizer_state", False)
+            or getattr(cfg.run, "resume_skip_optimizer_state", False)
+        )
+        if sharded_resume_mode or skip_resume_optim_state:
             if is_main:
-                logger.warning(
-                    "Sharded resume mode: skipping optimizer/scheduler state load due sharded "
-                    "state incompatibility. Model weights and step counters are restored."
-                )
+                if sharded_resume_mode:
+                    logger.warning(
+                        "Sharded resume mode: skipping optimizer/scheduler state load due sharded "
+                        "state incompatibility. Model weights and step counters are restored."
+                    )
+                else:
+                    logger.warning(
+                        "Resume configured to skip optimizer/scheduler state load "
+                        "(resume_skip_optimizer_state=True)."
+                    )
         else:
             if optimizer is not None and "optimizer" in ckpt:
                 try:
@@ -2044,6 +2061,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         deepspeed_zero_grad_compat(deepspeed_engine)
     micro_step = resume_micro_step
     update_step = resume_step
+    probe_only_collected = 0
     video_data_iter = iter(dataloader_video)
     image_data_iter = iter(dataloader_image) if dataloader_image is not None else None
     video_micro_count = 0
@@ -2438,6 +2456,22 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         }
         if chunk_index is not None:
             model_kwargs["chunk_index"] = chunk_index
+        cond_y_shape_str = "x".join(str(v) for v in model_kwargs["y"].shape)
+        cond_mask_shape_str = "x".join(str(v) for v in mask.shape) if isinstance(mask, torch.Tensor) else "none"
+        cond_mask_nonpad = float("nan")
+        cond_mask_tok_mean = float("nan")
+        if isinstance(mask, torch.Tensor):
+            cond_mask_2d = mask
+            if cond_mask_2d.dim() == 4:
+                cond_mask_2d = cond_mask_2d.squeeze(1).squeeze(1)
+            elif cond_mask_2d.dim() == 3:
+                cond_mask_2d = cond_mask_2d.squeeze(1)
+            if cond_mask_2d.dim() == 2:
+                cond_mask_nonpad = float(cond_mask_2d.float().mean().item())
+                cond_mask_tok_mean = float(cond_mask_2d.float().sum(dim=1).mean().item())
+        cond_y_token_norm = student_embeds_for_dit.float().norm(dim=-1)
+        cond_y_norm_mean = float(cond_y_token_norm.mean().item())
+        cond_y_norm_std = float(cond_y_token_norm.std(unbiased=False).item())
         if micro_step == 0:
             logger.info("Rank %s before SANA training_losses forward", rank)
         loss_term = sana_train_diffusion.training_losses(
@@ -2460,9 +2494,17 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             and conditioning_diag_every > 0
             and ((update_step + 1) % conditioning_diag_every == 0)
         )
+        run_conditioning_pred_probe = bool(
+            is_sync_step
+            and conditioning_pred_probe_every > 0
+            and ((update_step + 1) % conditioning_pred_probe_every == 0)
+            and len(conditioning_pred_probe_prompts) >= 2
+        )
         cond_diag_shuffle_dloss = float("nan")
         cond_diag_uncond_dloss = float("nan")
         cond_diag_grad_norm = float("nan")
+        cond_pred_delta_l2 = float("nan")
+        cond_pred_delta_ratio = float("nan")
         if run_conditioning_diag and conditioning_diag_grad:
             # Non-leaf tensor; retain_grad is required to inspect conditioning gradient.
             student_embeds_for_dit.retain_grad()
@@ -2543,6 +2585,104 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                         timestep_weight=timestep_weight,
                     )
                     cond_diag_uncond_dloss = float((uncond_term["loss"].mean() - diff_loss.detach()).item())
+        if run_conditioning_pred_probe:
+            probe_was_training = student_module.training
+            try:
+                student_module.eval()
+                with torch.no_grad():
+                    probe_prompts = conditioning_pred_probe_prompts[:2]
+                    probe_emb, probe_mask = student_module(probe_prompts, return_mask=True)
+                    if probe_emb.dim() == 1:
+                        probe_emb = probe_emb.unsqueeze(0).unsqueeze(0)
+                    elif probe_emb.dim() == 2:
+                        probe_emb = probe_emb.unsqueeze(0)
+                    probe_emb = F.layer_norm(probe_emb.float(), (probe_emb.shape[-1],)).to(dtype)
+                    if probe_mask is None:
+                        probe_mask = torch.ones(
+                            (probe_emb.shape[0], probe_emb.shape[1]), device=device, dtype=torch.long
+                        )
+                    else:
+                        probe_mask = probe_mask.to(device=device, dtype=torch.long)
+                        if probe_mask.dim() == 1:
+                            probe_mask = probe_mask.unsqueeze(0)
+                        probe_mask = pad_or_trim_token_mask(probe_mask, probe_emb.shape[1])
+
+                    probe_data_info = {}
+                    for k, v in data_info.items():
+                        if isinstance(v, torch.Tensor) and v.shape[0] == b:
+                            probe_data_info[k] = v[:1]
+                        else:
+                            probe_data_info[k] = v
+
+                    probe_xt = noisy_for_cfg[:1]
+                    probe_t = timesteps[:1]
+                    probe_kwargs_a = {
+                        "mask": probe_mask[:1].unsqueeze(1).unsqueeze(1),
+                        "data_info": probe_data_info,
+                    }
+                    probe_kwargs_b = {
+                        "mask": probe_mask[1:2].unsqueeze(1).unsqueeze(1),
+                        "data_info": probe_data_info,
+                    }
+                    if chunk_index is not None:
+                        probe_kwargs_a["chunk_index"] = chunk_index
+                        probe_kwargs_b["chunk_index"] = chunk_index
+
+                    pred_a = diffusion_model(
+                        probe_xt,
+                        probe_t,
+                        probe_emb[:1].unsqueeze(1),
+                        **probe_kwargs_a,
+                    )
+                    pred_b = diffusion_model(
+                        probe_xt,
+                        probe_t,
+                        probe_emb[1:2].unsqueeze(1),
+                        **probe_kwargs_b,
+                    )
+                    pred_delta = (pred_a.float() - pred_b.float()).reshape(1, -1)
+                    pred_a_flat = pred_a.float().reshape(1, -1)
+                    cond_pred_delta_l2 = float(pred_delta.norm(dim=1).mean().item())
+                    cond_pred_delta_ratio = float(
+                        cond_pred_delta_l2 / (pred_a_flat.norm(dim=1).mean().item() + 1e-8)
+                    )
+            except Exception as exc:
+                if is_main:
+                    logger.warning("conditioning_pred_probe failed: %s", exc)
+            finally:
+                if probe_was_training:
+                    student_module.train()
+        if probe_only and is_sync_step:
+            if is_main:
+                probe_log = (
+                    "ProbeOnly Step %d | y_shape=%s mask_shape=%s mask_nonpad=%.4f mask_tok=%.2f "
+                    "y_norm=%.4f±%.4f cond_shuffle_dloss=%.6f cond_uncond_dloss=%.6f "
+                    "cond_pred_l2=%.6f cond_pred_ratio=%.6f"
+                    % (
+                        update_step + 1,
+                        cond_y_shape_str,
+                        cond_mask_shape_str,
+                        cond_mask_nonpad,
+                        cond_mask_tok_mean,
+                        cond_y_norm_mean,
+                        cond_y_norm_std,
+                        cond_diag_shuffle_dloss,
+                        cond_diag_uncond_dloss,
+                        cond_pred_delta_l2,
+                        cond_pred_delta_ratio,
+                    )
+                )
+                logger.info(probe_log)
+            probe_only_collected += 1
+            if probe_only_collected >= probe_only_steps:
+                if is_main:
+                    logger.info(
+                        "Probe-only mode complete: collected %d step(s), exiting before backward/optimizer.",
+                        probe_only_collected,
+                    )
+                break
+            micro_step += 1
+            continue
 
         aux_active = (update_step + 1) >= aux_start_step
         distill_mse_loss = torch.tensor(0.0, device=device)
@@ -2898,12 +3038,26 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     cfg_cond_ctx_norm,
                     cfg_uncond_ctx_norm,
                 )
+            if conditioning_shape_log:
+                log_line += " y_shape=%s mask_shape=%s mask_nonpad=%.4f mask_tok=%.2f y_norm=%.4f±%.4f" % (
+                    cond_y_shape_str,
+                    cond_mask_shape_str,
+                    cond_mask_nonpad,
+                    cond_mask_tok_mean,
+                    cond_y_norm_mean,
+                    cond_y_norm_std,
+                )
             if not math.isnan(cond_diag_shuffle_dloss):
                 log_line += " cond_shuffle_dloss=%.6f" % cond_diag_shuffle_dloss
             if not math.isnan(cond_diag_uncond_dloss):
                 log_line += " cond_uncond_dloss=%.6f" % cond_diag_uncond_dloss
             if not math.isnan(cond_diag_grad_norm):
                 log_line += " cond_grad=%.6f" % cond_diag_grad_norm
+            if not math.isnan(cond_pred_delta_ratio):
+                log_line += " cond_pred_l2=%.6f cond_pred_ratio=%.6f" % (
+                    cond_pred_delta_l2,
+                    cond_pred_delta_ratio,
+                )
             if semantic_enabled:
                 log_line += " sem_var=%.6f sem_cov=%.6f sem_geom=%.6f" % (
                     semantic_var_loss.item(),
@@ -3038,7 +3192,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
 
     student_state = build_student_checkpoint_state(student, student_module)
     dit_state = get_trainable_dit_state_dict(diffusion_model)
-    if is_main:
+    if is_main and (not probe_only):
         final_ckpt_path = os.path.join(run_dir, "checkpoint_final.pt")
         os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
         torch.save(
@@ -3066,6 +3220,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "train_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+    elif is_main and probe_only:
+        logger.info("Probe-only mode: skipped final checkpoint save.")
 
     if dist.is_initialized():
         if use_barrier:
@@ -3087,6 +3243,11 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-gpus", type=int, default=1)
     parser.add_argument("--resume-from", type=str, default=None, help="Resume training from checkpoint path")
+    parser.add_argument(
+        "--resume-skip-optimizer-state",
+        action="store_true",
+        help="Skip loading optimizer/scheduler state when resuming (useful for debug resume or trainable-set changes).",
+    )
     parser.add_argument(
         "--single-gpu-debug",
         action="store_true",

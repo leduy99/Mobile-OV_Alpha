@@ -2,7 +2,7 @@ run:
   seed: 1234
   output_dir: output/stage1_teacher_free_msrvtt_sana_nochunk_nochi_noanticollapse
   log_every: 20
-  save_every_steps: 200
+  save_every_steps: 500
   num_workers: 0
   precision: bf16
   auto_download_pretrained: true
@@ -125,7 +125,8 @@ data:
 train:
   total_steps: 100000
   flow_shift: 3.0
-  use_sana_process_timesteps: true
+  use_sana_process_timesteps: false
+  force_ivjoint_timestep: true
   chunk_sampling_strategy: uniform
   same_timestep_prob: 0.0
   timestep_weight: false

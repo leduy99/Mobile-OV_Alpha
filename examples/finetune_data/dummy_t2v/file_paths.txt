@@ -1,0 +1,8 @@
+examples/finetune_data/dummy_t2v/dummy_sample_0000.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0001.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0002.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0003.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0004.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0005.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0006.pkl
+examples/finetune_data/dummy_t2v/dummy_sample_0007.pkl

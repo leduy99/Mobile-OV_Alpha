@@ -16,10 +16,10 @@ import numpy as np
 from PIL import Image
 import cv2
 
-from wan.configs import WAN_CONFIGS
-from wan.modules.vae import WanVAE
-from wan.modules.t5 import T5EncoderModel
-from wan.utils.utils import str2bool
+from nets.third_party.wan.configs import WAN_CONFIGS
+from nets.third_party.wan.modules.vae import WanVAE
+from nets.third_party.wan.modules.t5 import T5EncoderModel
+from nets.third_party.wan.utils.utils import str2bool
 
 warnings.filterwarnings('ignore')
 
@@ -189,7 +189,10 @@ def read_video_frames(video_path, frame_num, sampling_rate=3, skip_num=0, target
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-    logging.info(f"Video info: Total frames={total_frames}, FPS={fps}, Resolution={width}x{height}")
+    logging.info(
+        f"Video info: Total frames={total_frames}, FPS={fps}, "
+        f"source_resolution={width}x{height}, target_size={target_size[1]}x{target_size[0]}"
+    )
     
     # Calculate sampling interval
     # if total_frames < frame_num * sampling_rate + skip_num:

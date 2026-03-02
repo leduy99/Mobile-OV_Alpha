@@ -13,15 +13,20 @@ class OmniVideoDataset(Dataset):
     video latent features, and other metadata needed for training.
     """
     
-    def __init__(self, file_path):
+    def __init__(self, file_path, max_samples=None):
         """
         Initialize the dataset with a list of pickle file paths.
         
         Args:
-            file_paths (list): List of paths to pickle files containing pre-encoded features
+            file_path (str): Path to text file listing pickle file paths
+            max_samples (int, optional): Maximum number of samples to load (for testing)
         """
         with open(file_path, 'r') as ins:
             self.file_paths = [it.strip(' \t\n') for it in ins]
+        
+        # Limit to max_samples if specified (for testing)
+        if max_samples is not None and max_samples > 0:
+            self.file_paths = self.file_paths[:max_samples]
     
     def __len__(self):
         """Return the number of samples in the dataset."""
@@ -232,7 +237,7 @@ def pad_tensors_to_same_size(tensors, key_name, batch):
         fallback_tensors = [valid_tensors[0].clone() for _ in range(len(tensors))]
         return torch.stack(fallback_tensors, dim=0)
 
-def create_omnivideo_dataloader(file_path, batch_size=1, shuffle=True, num_workers=4, distributed=False, rank=0, world_size=1):
+def create_omnivideo_dataloader(file_path, batch_size=1, shuffle=True, num_workers=4, distributed=False, rank=0, world_size=1, max_samples=None):
     """    
     Args:
         file_path (str): Path to a text file containing paths to pickle files
@@ -242,11 +247,12 @@ def create_omnivideo_dataloader(file_path, batch_size=1, shuffle=True, num_worke
         distributed (bool, optional): Whether to use distributed sampling. Defaults to False.
         rank (int, optional): Rank of the current process in distributed training. Defaults to 0.
         world_size (int, optional): Total number of processes in distributed training. Defaults to 1.
+        max_samples (int, optional): Maximum number of samples to load (for testing). Defaults to None.
         
     Returns:
         DataLoader: PyTorch DataLoader for the OmniVideoDataset
     """
-    dataset = OmniVideoDataset(file_path)
+    dataset = OmniVideoDataset(file_path, max_samples=max_samples)
     
     # 为分布式训练创建采样器
     if distributed:

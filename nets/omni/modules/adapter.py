@@ -11,6 +11,9 @@ class DM_Adapter(nn.Module):
         in_channels=1152,
         out_channels=4096,
         learnable_query_length=256, 
+        num_encoder_layers: int = 4,
+        num_decoder_layers: int = 4,
+        ff_mult: int = 4,
         TRAINABLE_PRECISION=torch.float32, # torch.float16, torch.bfloat16
         device_id=0,
         rank=0,
@@ -64,9 +67,9 @@ class DM_Adapter(nn.Module):
             batch_first=True, 
             norm_first=True, 
             d_model=self.out_channels, 
-            num_encoder_layers=4, 
-            num_decoder_layers=4, 
-            dim_feedforward=self.out_channels * 4, 
+            num_encoder_layers=int(num_encoder_layers), 
+            num_decoder_layers=int(num_decoder_layers), 
+            dim_feedforward=self.out_channels * int(ff_mult), 
             dropout=0.0, 
             dtype=TRAINABLE_PRECISION
         )
@@ -109,14 +112,32 @@ class DM_Adapter(nn.Module):
 
         # Map checkpoint to current device when loading
         ckpt = torch.load(ckpt_path, map_location=self.device)
-        # If checkpoint contains 'state_dict' key, take its value, otherwise consider the entire checkpoint as state_dict
-        state_dict = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        # If checkpoint contains 'state_dict' or 'model_state_dict', take its value
+        if isinstance(ckpt, dict):
+            if "state_dict" in ckpt:
+                state_dict = ckpt["state_dict"]
+            elif "model_state_dict" in ckpt:
+                state_dict = ckpt["model_state_dict"]
+            else:
+                state_dict = ckpt
+        else:
+            state_dict = ckpt
 
         # Strip potentially existing "module." prefix
         new_state_dict = {}
         for key, value in state_dict.items():
             new_key = key[len("module."):] if key.startswith("module.") else key
             new_state_dict[new_key] = value
+
+        # Drop decoder_query if query length mismatch to allow training with new length.
+        if "decoder_query" in new_state_dict and "decoder_query" in self.state_dict():
+            if new_state_dict["decoder_query"].shape != self.state_dict()["decoder_query"].shape:
+                logging.warning(
+                    "Adapter decoder_query shape mismatch (%s -> %s); reinitializing decoder_query.",
+                    tuple(new_state_dict["decoder_query"].shape),
+                    tuple(self.state_dict()["decoder_query"].shape),
+                )
+                new_state_dict.pop("decoder_query")
 
         # Use non-strict loading and print missing and unexpected keys for debugging
         missing_keys, unexpected_keys = self.load_state_dict(new_state_dict, strict=False)

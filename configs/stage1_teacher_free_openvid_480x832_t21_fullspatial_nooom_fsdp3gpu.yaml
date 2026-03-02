@@ -1,0 +1,159 @@
+run:
+  seed: 1234
+  output_dir: output/stage1_teacher_free_openvid_480x832_t21_fullspatial_nooom_fsdp3gpu
+  log_every: 10
+  save_every_steps: 1000
+  num_workers: 4
+  precision: bf16
+  gradient_checkpointing: true
+  fsdp_disable_flash_sdp: false
+  fsdp_disable_grad_checkpointing: false
+  student_ddp: false
+  student_fsdp: false
+  student_sync: true
+  dit_sync: false
+  manual_sync_backend: nccl
+  use_barrier: false
+  dit_ddp_find_unused_parameters: false
+  student_ddp_find_unused_parameters: false
+  sync_bucket_max_elems: 25000000
+  log_lora_grad: false
+  debug_probe_every_steps: 100
+  cfg_dropout_prob: 0.1
+  cfg_delta_every_steps: 20
+  cfg_delta_uncond_prompt: ""
+  strict_sana_parity_text_path: true
+  strict_fail_fast_mask: true
+  auto_download_pretrained: false
+  debug_probe_prompts:
+    - "a cat playing with a wool beside a fireside"
+    - "a fox running through a snowy forest at sunrise"
+    - "a red sports car drifting on a wet city street at night"
+    - "an astronaut floating above earth in space"
+    - "waves crashing against cliffs during a storm"
+    - "a chef slicing vegetables in a busy kitchen"
+
+model:
+  student:
+    text_encoder:
+      ckpt_path: omni_ckpts/smolvlm2_500m/smolvlm2_500m.pt
+      max_length: 512
+      tokenizer_model_id: HuggingFaceTB/SmolVLM-Instruct
+    vision_head_frozen: true
+    use_vision_head: false
+    conditioner_bridge:
+      out_seq_len: 300
+      out_dim: 2304
+    adapter_ckpt_dir: null
+    adapter_in_channels: 960
+    adapter_out_channels: 2304
+    adapter_query_length: 128
+    force_adapter_query_length: 128
+    smol_vh_num_queries: 1
+    adapter_num_encoder_layers: 2
+    adapter_num_decoder_layers: 2
+    adapter_ff_mult: 2
+    resampler_num_heads: 8
+    resampler_mlp_mult: 2
+    gate_min_value: 0.0
+    lora:
+      enable: false
+      r: 8
+      alpha: 16
+      dropout: 0.05
+      target_modules: [q_proj, v_proj]
+    projector:
+      type: mcp_tiny
+      mcp_hidden_dim: 384
+      mcp_num_fuse_layers: 4
+      mcp_use_refine: false
+      mcp_refine_kernel_size: 3
+      mcp_fusion_temperature: 1.0
+  dit:
+    train_modules: [cross_attn]
+    fsdp: true
+    ddp: false
+    deepspeed: false
+    fsdp_sharding_strategy: full_shard
+    chunk_index: null
+
+sana:
+  config: configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml
+  dit_ckpt: omni_ckpts/sana_video_2b_480p
+  timesteps:
+    num_train_timesteps: 1000
+
+data:
+  openvid:
+    csv_path: data/openvid/OpenVid_subset_t21_480_smoke_20260227.csv
+    video_dir: data/openvid/videos
+    preprocessed_dir: data/openvid/preprocessed
+    use_preprocessed: true
+    max_samples: null
+    expected_latent_t: 21
+    expected_frame_num: 81
+  preprocessing:
+    normalize_whitespace: true
+    strip: true
+    remove_double_newlines: true
+    use_chi_prompt: false
+    use_prompt_templates: false
+    max_prompt_tokens: 200
+  motion_score: 10
+  prompt_templates:
+    - "A video of {prompt}. motion score: {motion_score}."
+    - "Video: {prompt}. motion score: {motion_score}."
+    - "{prompt}. motion score: {motion_score}."
+    - "A short video clip of {prompt}. motion score: {motion_score}."
+    - "A cinematic video of {prompt}. motion score: {motion_score}."
+  batching:
+    batch_size: 1
+    grad_accum_steps: 1
+    shuffle: true
+    drop_last: true
+
+train:
+  total_steps: 500
+  flow_shift: 3.0
+  strict_chunk_parity: false
+  optimizer:
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.0
+  lr:
+    bridge: 5.0e-5
+    dit: 1.0e-5
+    warmup_steps: 1000
+    min_lr_ratio: 0.1
+    max_grad_norm: 0.1
+
+loss:
+  diff:
+    weight: 1.0
+  distill:
+    enabled: false
+    use_attention_mask: true
+    token_mse_weight: 0.5
+    token_cos_weight: 0.25
+    pooled_cos_weight: 0.1
+    precomputed:
+      dir: output/precomputed_teacher/openvid_subset_teacher_full
+      preload: false
+      max_cached_shards: 2
+  semantic_probe:
+    enabled: false
+    weight: 0.0
+    var_weight: 1.0
+    cov_weight: 0.05
+    target_std: 1.0
+    every_steps: 1
+    max_prompts: 8
+    prompts: []
+  norm:
+    enabled: false
+    weight: 0.0
+    target: 48.0
+  gate:
+    enabled: false
+    weight: 0.0
+    target: 1.0
