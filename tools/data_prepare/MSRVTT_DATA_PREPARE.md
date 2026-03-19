@@ -1,26 +1,30 @@
-# MSR-VTT Data Prepare (Download + WAN VAE Encode)
+# MSR-VTT Data Preparation
 
-Script:
+Canonical script:
 - `tools/data_prepare/msrvtt_data_prepare.py`
 
-## Auth (HuggingFace)
+## Environment
 
-Do not commit raw tokens into git.
-
-Recommended:
+Use the canonical repo environment:
 
 ```bash
-hf auth login --token <YOUR_HF_TOKEN>
+conda activate mobileov
+```
+
+## Hugging Face Auth
+
+Authenticate if required by your local setup:
+
+```bash
+huggingface-cli login
 # or
 export HF_TOKEN=<YOUR_HF_TOKEN>
 ```
 
-Current local token note (masked): `hf_NRZK...TTvGt`
-
-## 1) Download + extract raw MSR-VTT files
+## 1. Download and Extract Raw MSR-VTT Files
 
 ```bash
-python tools/data_prepare/msrvtt_data_prepare.py download \
+PYTHONPATH=. python tools/data_prepare/msrvtt_data_prepare.py download \
   --root-dir data/msrvtt \
   --repo-id AlexZigma/msr-vtt \
   --extract
@@ -32,14 +36,14 @@ This downloads:
 - `train.parquet`
 - `val.parquet`
 
-into `data/msrvtt/raw/`, then extracts to:
-- videos: `data/msrvtt/videos/TestVideo/*.mp4`
-- metadata: `data/msrvtt/metadata/*.json` (or fallback from `raw/`)
+Outputs:
+- videos under `data/msrvtt/videos/TestVideo/`
+- metadata under `data/msrvtt/metadata/`
 
-## 2) Build OpenVid-style CSV (`video,caption`)
+## 2. Build an OpenVid-style CSV
 
 ```bash
-python tools/data_prepare/msrvtt_data_prepare.py build-csv \
+PYTHONPATH=. python tools/data_prepare/msrvtt_data_prepare.py build-csv \
   --root-dir data/msrvtt \
   --manifest-name OpenVid_extracted_subset_unique.csv \
   --caption-policy longest \
@@ -49,10 +53,10 @@ python tools/data_prepare/msrvtt_data_prepare.py build-csv \
 Output:
 - `data/msrvtt/OpenVid_extracted_subset_unique.csv`
 
-## 3) Encode WAN VAE (single GPU)
+## 3. Encode WAN VAE Latents (Single GPU)
 
 ```bash
-python tools/data_prepare/msrvtt_data_prepare.py encode \
+PYTHONPATH=. python tools/data_prepare/msrvtt_data_prepare.py encode \
   --root-dir data/msrvtt \
   --manifest-name OpenVid_extracted_subset_unique.csv \
   --ckpt-dir omni_ckpts/wan/wanxiang1_3b \
@@ -71,7 +75,7 @@ Each pickle contains:
 - `video_path`
 - `frame_num`
 
-## 4) Encode WAN VAE (multi-GPU)
+## 4. Encode WAN VAE Latents (Multi-GPU)
 
 ```bash
 torchrun --standalone --nproc_per_node=4 \
@@ -85,10 +89,10 @@ torchrun --standalone --nproc_per_node=4 \
   --target-size 480,832
 ```
 
-## 5) One-shot full pipeline
+## 5. One-shot Pipeline
 
 ```bash
-python tools/data_prepare/msrvtt_data_prepare.py all \
+PYTHONPATH=. python tools/data_prepare/msrvtt_data_prepare.py all \
   --root-dir data/msrvtt \
   --repo-id AlexZigma/msr-vtt \
   --manifest-name OpenVid_extracted_subset_unique.csv \

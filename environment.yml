@@ -1,4 +1,4 @@
-name: wanx
+name: mobileov
 channels:
   - defaults
 dependencies:
@@ -151,6 +151,7 @@ dependencies:
       - pydantic==2.10.6
       - pydantic-core==2.27.2
       - pydub==0.25.1
+      - pyrallis==0.3.1
       - pygments==2.19.1
       - pyparsing==3.2.3
       - pytest==8.3.5
@@ -163,7 +164,6 @@ dependencies:
       - requests==2.32.3
       - rich==13.9.4
       - ruff==0.9.10
-      - s2wrapper==0.1
       - s3transfer==0.11.4
       - safehttpx==0.1.6
       - safetensors==0.5.3
@@ -205,6 +205,6 @@ dependencies:
       - xfuser==0.4.3.post3
       - xxhash==3.5.0
       - yarl==1.18.3
+      - yt-dlp
       - yunchang==0.6.3.post1
       - zipp==3.21.0
-prefix: /cpfs01/projects-HDD/cfff-01ff502a0784_HDD/public/yanghao/software/miniconda3/envs/wanx

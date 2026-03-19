@@ -1,149 +1,160 @@
-<div align="center">
-<h1>Omni-Video: Democratizing Unified Video Understanding and Generation</h1>
+# MobileOV + SANA Training Repo
 
+This repository is the cleaned training and inference workspace we use for the
+`SmolVLM2 -> bridge/projector -> SANA Video DiT` pipeline.
 
-[Zhiyu Tan*](https://openreview.net/profile?id=~Zhiyu_Tan1) · [Hao Yang*](https://openreview.net/profile?id=~Yang_Hao4) ·[Luozheng Qin](https://openreview.net/profile?id=~Luozheng_Qin1) · [Jia Gong](https://scholar.google.com/citations?user=ZV-ThegAAAAJ&hl=zh-CN&oi=ao) · [Mengping Yang](https://scholar.google.com/citations?user=yF34LtcAAAAJ&hl=zh-CN)<sup>&#9993;</sup> · [Hao Li](https://scholar.google.com/citations?user=pHN-QIwAAAAJ&hl=zh-CN)  <sup>&#9993;</sup>
+It is focused on a narrow, practical scope:
+- text-to-video training and inference,
+- OpenVid data preparation,
+- LAION / COYO image materialization and encoding,
+- MSR-VTT download + WAN-VAE encoding,
+- the 3-stage Gemma-distilled training pipeline.
 
-<sup>*</sup>Equal Contribution
-<sup>&#9993;</sup>Corresponding Authors
+It is **not** intended to be a polished release of every Omni-Video research
+path. Legacy understanding pipelines, HD-VILA flows, and old experiment notes
+are intentionally de-emphasized or archived.
 
-
-
-<a href='https://howellyoung-s.github.io/OmniVideo_project/'><img src='https://img.shields.io/badge/Project-Page-green'></a>
-<a href='https://arxiv.org/pdf/2507.06119'><img src='https://img.shields.io/badge/Technique-Report-red'></a>
-<a href='https://huggingface.co/howellyoung1/OmniVideo11B/tree/main'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-blue'></a>
-
-</div>
-
-> **TL; DR:**  ***Omini-Video*** is a video unified model that enables various video tasks including video understanding, generation editing within a single framework.
-
- ![image](./assets/teaser.png)
-
-## 🔥 Latest News
-* August 6, 2025: 🔥🔥 We are glad to release our code, which includes support for both inference and fine-tuning!
-* August 6, 2025: 🔥🔥 Our version v0.1 model is uploaded to [HF Model](https://huggingface.co/howellyoung1/OmniVideo11B/tree/main) now!
-* Jul 07, 2025: We release the [Technique-Report](https://arxiv.org/pdf/2507.06119) of **Omni-Video** 
-* Jul 07, 2025: We release the [project page](https://howellyoung-s.github.io/OmniVideo_project/) of **Omni-Video**
-
-## 📑 Tasks supported by the unified Omni-Video
-- Visual understanding
-    - [✔] Image understanding
-    - [✔] Video understanding
-- Visual generation
-    - [✔] Text-to-Video generation
-    - [✔] Text-to-Image generation
-    - [✔] Video-to-Video editting
-    - [✔] Image-to-Image editting
-
-## 🚀 Quick Start
-
-### Inference
-```bash
-# Run inference with sample data
-bash tools/inference/inference.sh
-```
+## Supported Scope
 
 ### Training
+- Stage 1: prompt-only teacher distillation
+- Stage 2: bridge reinjection with frozen DiT
+- Stage 3: bridge + full DiT training
+- student adaptation modes:
+  - top-N SmolVLM2 text layers,
+  - final norm on/off,
+  - LoRA on/off,
+  - bridge-only vs bridge+DiT
+
+### Inference
+- canonical backend: `fixed`
+- student checkpoint loading with:
+  - SmolVLM2 trainable text state,
+  - bridge/projector state,
+  - optional DiT trainable state,
+  - optional LoRA state
+
+### Data workflows in scope
+- OpenVid
+- LAION / COYO
+- MSR-VTT
+
+## Canonical Environment
+
+The canonical environment name is `mobileov`.
+
 ```bash
-# Quick training with sample data
-# Sample data are availabe in examples/finetune_data
-bash finetune.sh
+conda env create -f environment.yml
+conda activate mobileov
 ```
-For detailed usage instructions, please refer to the [SETUP_MODELS.md](SETUP_MODELS.md).
 
-## Abstract 
-Notable breakthroughs in unified understanding and generation modeling have led to remarkable advancements in image understanding, reasoning, production and editing, yet current foundational models predominantly focus on processing images, creating a gap in the development of unified models for video understanding and generation. This report presents ***Omni-Video***, an efficient and effective unified framework for video understanding, generation, as well as instruction-based editing. Our key insight is to teach existing multimodal large language models (MLLMs) to produce continuous visual clues that are used as the input of diffusion decoders, which produce high-quality videos conditioned on these visual clues. To fully unlock the potential of our system for unified video modeling, we integrate several technical improvements: 1) a lightweight architectural design that respectively attaches a vision head on the top of MLLMs and a adapter before the input of diffusion decoders, the former produce visual tokens for the latter, which adapts these visual tokens to the conditional space of diffusion decoders; and 2) an efficient multi-stage training scheme that facilitates a fast connection between MLLMs and diffusion decoders with limited data and computational resources. We empirically demonstrate that our model exhibits satisfactory generalization abilities across video generation, editing and understanding tasks.
+If the environment already exists:
 
- ![image](./assets/framework.png)
-
-
-
-
-## Demos
-
-### Text-to-Video
-
-<div align="center">
-
-| Group 1 | Group 2 | Group 3 |
-|--------|--------|--------|
-| ![Text-to-Video Demo 1](./assets/t2v/001.gif) | ![Text-to-Video Demo 2](./assets/t2v/002.gif) | ![Text-to-Video Demo 3](./assets/t2v/003.gif) |
-| ![Text-to-Video Demo 4](./assets/t2v/004.gif) | ![Text-to-Video Demo 5](./assets/t2v/005.gif) | ![Text-to-Video Demo 6](./assets/t2v/006.gif) |
-| ![Text-to-Video Demo 7](./assets/t2v/007.gif) | ![Text-to-Video Demo 8](./assets/t2v/008.gif) | ![Text-to-Video Demo 9](./assets/t2v/009.gif) |
-
-</div>
-
-### Video-to-Video
-Our model offers video editing capabilities. While its generalization may not always be optimal due to the high cost of training data, multiple sampling can often improve results. For better performance, fine-tuning with high-quality data is also a recommended option.
-
-
-<div align="center">
-
-| Group 1 | Group 2 |
-|--------|--------|
-| ![Video Demo 1](./assets/v2v/v2v_demo_001.gif) | ![Video Demo 2](./assets/v2v/v2v_demo_002.gif) |
-| ![Video Demo 3](./assets/v2v/v2v_demo_003.gif) | ![Video Demo 4](./assets/v2v/v2v_demo_004.gif) |
-| ![Video Demo 5](./assets/v2v/v2v_demo_005.gif) | ![Video Demo 6](./assets/v2v/v2v_demo_006.gif) |
-
-
-| Group 3 | Group 4 |
-|-------|-------|
-| ![Concat Demo 1](./assets/v2v/concat_0.gif) | ![Concat Demo 2](./assets/v2v/concat_1.gif) |
-| ![Concat Demo 3](./assets/v2v/concat_2.gif) | ![Concat Demo 4](./assets/v2v/concat_3.gif) |
-| ![Concat Demo 5](./assets/v2v/concat_4.gif) | ![Concat Demo 6](./assets/v2v/concat_5.gif) |
-
-</div>
-
-### Text-to-image
- ![image](./assets/t2i/t2i_01.png)
-
-### Image-to-image Editing
-<table border="0" style="width: 100%; text-align: left; margin-top: 20px;">
-  <tr>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id69_source.jpg" width="600">
-      </td>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id69_generated.png" width="600">
-      </td>
-  </tr>
-  <tr>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id94_source.jpg" width="600">
-      </td>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id94_generated.png" width="600">
-      </td>
-  </tr>
-  <tr>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id389_source.jpg" width="600">
-      </td>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id389_generated.png" width="600">
-      </td>
-  </tr>
-  <tr>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id366_source.jpg" width="600">
-      </td>
-      <td>
-          <img src="./assets/i2i/i2i_reduced_second_id_to_filename_id366_generated.png" width="600">
-      </td>
-  </tr>
-</table>
-
-
-## Acknowledgement
-We would like to thank [VILA](https://github.com/NVlabs/VILA) and [Wan2.1](https://github.com/Wan-Video/Wan2.1) for their excellent work. 
-
-## BibTex
-
-```bibtex
-@article{tan2025omni,
-  title={Omni-Video: Democratizing Unified Video Understanding and Generation},
-  author={Tan, Zhiyu and Yang, Hao and Qin, Luozheng and Gong, Jia and Yang, Mengping and Li, Hao},
-  journal={arXiv preprint arXiv:2507.06119},
-  year={2025}
-}
+```bash
+conda env update -f environment.yml --prune
+conda activate mobileov
 ```
+
+For OpenVid DataOps convenience commands, install the local package once:
+
+```bash
+pip install -e download_data
+```
+
+## Model Asset Bootstrap
+
+### Auto-bootstrap is available
+These entrypoints will auto-download / auto-convert model assets when missing:
+- `tools/train_stage1_teacher_free.py`
+- `tools/train_q1_sana_bridge.py`
+- `tools/inference/sana_video_inference_fixed.py`
+- `tools/inference/test_q1_student_video.py`
+
+This covers:
+- SANA video checkpoint assets
+- converted SmolVLM2 checkpoint
+
+### Still manual
+WAN VAE assets used by OpenVid / MSR-VTT latent encoding are still explicit
+setup steps. See the dataset guides below.
+
+## Quick Start
+
+### 1. Train the 3-stage pipeline
+
+```bash
+GPUS=0,1 bash scripts/train_openvid_current_laion_coyo_3stage_gemma_distill_5v1i.sh
+```
+
+### 2. Run inference from a student checkpoint
+
+```bash
+PYTHONPATH=. python tools/inference/test_q1_student_video.py \
+  --bridge-ckpt /path/to/checkpoint_stepXXXX.pt \
+  --prompt "a golden retriever running along a beach at sunset" \
+  --output-dir output/inference_example \
+  --sana-backend fixed \
+  --steps 24 \
+  --cfg-scale 3.0
+```
+
+## Dataset Guides
+
+### OpenVid
+Canonical options:
+- `download_data/` for OpenVid DataOps
+- `tools/data_prepare/download_openvid.py` for lightweight CSV / part download
+
+See:
+- `OPENVID_TRAINING_GUIDE.md`
+- `download_data/README.md`
+
+### MSR-VTT
+Use:
+- `tools/data_prepare/msrvtt_data_prepare.py`
+
+See:
+- `tools/data_prepare/MSRVTT_DATA_PREPARE.md`
+
+### LAION / COYO
+Current repo support is manifest-based rather than one-shot raw crawling.
+Canonical tools are:
+- `tools/data_prepare/materialize_unified_manifest.py`
+- `tools/data_prepare/recover_laion_images_unique.py`
+- `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
+
+## Main Entry Points
+
+### Training
+- `tools/train_q1_sana_bridge.py`
+- `tools/train_stage1_teacher_free.py`
+- `scripts/train_openvid_current_laion_coyo_3stage_gemma_distill_5v1i.sh`
+
+### Inference
+- `tools/inference/test_q1_student_video.py`
+- `tools/inference/sana_video_inference_fixed.py`
+
+### Data
+- `tools/data_prepare/download_openvid.py`
+- `tools/data_prepare/msrvtt_data_prepare.py`
+- `tools/data_prepare/materialize_unified_manifest.py`
+- `tools/data_prepare/recover_laion_images_unique.py`
+- `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
+- `download_data/`
+
+## What To Ignore
+
+These paths are not the current recommended public surface:
+- legacy inference backend,
+- archived configs and scripts,
+- old paper/demo instructions in archived notes,
+- HD-VILA-specific workflows.
+
+## Repository Notes
+
+- Top-level configs were intentionally trimmed to the most recent, representative
+  training settings.
+- Older experiments live under archive folders.
+- Runtime outputs, checkpoints, and datasets remain git-ignored.
+
+If you are onboarding a teammate, start with `SETUP_AND_TRAINING.md`.

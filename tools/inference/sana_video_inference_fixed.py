@@ -491,6 +491,24 @@ def generate_video(
     print(f"Generating video from prompt: {prompt}")
     print(f"Resolution: {width}x{height}, Frames: {num_frames}")
     print(f"Inference steps: {num_inference_steps}, CFG scale: {cfg_scale}")
+    print(
+        "Sampling parameters: backend=fixed seed=%d sampling_algo=%s num_steps=%d cfg_scale=%.4f "
+        "num_frames=%d height=%d width=%d negative_prompt_len=%d motion_score=%d "
+        "high_motion=%s use_chi_prompt=%s"
+        % (
+            int(seed),
+            str(sampling_algo),
+            int(num_inference_steps),
+            float(cfg_scale),
+            int(num_frames),
+            int(height),
+            int(width),
+            len(negative_prompt or ""),
+            int(motion_score),
+            bool(high_motion),
+            bool(use_chi_prompt),
+        )
+    )
     print("=" * 80)
     
     # Set seed
@@ -693,8 +711,9 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Download checkpoint if requested
-    if args.download_checkpoint:
+    # Download checkpoint if requested or missing locally.
+    checkpoint_missing = not os.path.exists(args.checkpoint_dir)
+    if args.download_checkpoint or checkpoint_missing:
         print("=" * 80)
         print("Downloading checkpoint...")
         print("=" * 80)
@@ -720,10 +739,6 @@ def main():
     latent_size = args.height // config.vae.vae_downsample_rate
 
     set_env(args.seed, getattr(config.model, "image_size", args.height) // config.vae.vae_downsample_rate)
-    
-    # Set HuggingFace cache to avoid disk space issues
-    os.environ['HF_HOME'] = '/share_4/users/duy/.cache/huggingface'
-    os.environ['HUGGINGFACE_HUB_CACHE'] = '/share_4/users/duy/.cache/huggingface'
     
     models = load_sana_models(
         config,

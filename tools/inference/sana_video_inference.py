@@ -348,6 +348,20 @@ def generate_video(
     print(f"Generating video from prompt: {prompt}")
     print(f"Resolution: {width}x{height}, Frames: {num_frames}")
     print(f"Inference steps: {num_inference_steps}, CFG scale: {cfg_scale}")
+    print(
+        "Sampling parameters: backend=legacy seed=%d num_steps=%d cfg_scale=%.4f flow_shift=%.4f "
+        "num_frames=%d height=%d width=%d device=%s"
+        % (
+            int(seed),
+            int(num_inference_steps),
+            float(cfg_scale),
+            7.0,
+            int(num_frames),
+            int(height),
+            int(width),
+            str(device),
+        )
+    )
     print("=" * 80)
     
     # Set seed

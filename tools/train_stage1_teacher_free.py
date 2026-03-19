@@ -82,6 +82,10 @@ try:
     from diffusion.utils.config import SanaVideoConfig
 except ModuleNotFoundError:
     from nets.third_party.sana.diffusion.utils.config import SanaVideoConfig
+try:
+    from diffusion.longsana.utils.model_wrapper import SanaTextEncoder
+except ModuleNotFoundError:
+    from nets.third_party.sana.diffusion.longsana.utils.model_wrapper import SanaTextEncoder
 
 # Reuse helpers from the distill script to avoid duplication.
 from tools.train_q1_sana_bridge import (
@@ -196,6 +200,18 @@ def ensure_sana_assets_available(
             missing_by_repo.setdefault(repo_id, []).append(rel_path)
 
     needs_download_local = bool(missing_by_repo)
+
+    # Fast path on shared local storage: if all required assets already exist,
+    # avoid any early distributed collectives here. This bootstrap stage happens
+    # immediately after process-group init, and we've seen NCCL occasionally
+    # wedge on the all_reduce below even when there is nothing to download.
+    if not needs_download_local:
+        for local_path in required_local:
+            if not os.path.exists(local_path):
+                raise FileNotFoundError(
+                    f"Required SANA asset missing before auto-download check: {local_path}"
+                )
+        return
 
     if missing_by_repo and is_main:
         logger.info("SANA checkpoints missing, auto-downloading to %s ...", sana_ckpt_dir)
@@ -685,9 +701,10 @@ def build_student(
         sana_chi_prompt=sana_chi_prompt_text,
     )
 
-    # Ensure consistent trainable flags across ranks, then freeze the text tower
-    # (and optionally the vision head).
+    # Ensure consistent trainable flags across ranks, then apply the text-tower
+    # training policy (frozen / LoRA / top-N full layers).
     student.requires_grad_(True)
+    text_enc_cfg = student_cfg.get("text_encoder", AttrDict())
     lora_enabled = bool(student_cfg.get("lora", {}).get("enable", False))
     student.smolvlm2_model.eval().requires_grad_(False)
     if lora_enabled:
@@ -699,6 +716,53 @@ def build_student(
         for name, p in student.smolvlm2_model.named_parameters():
             if "lora_A" in name or "lora_B" in name:
                 p.requires_grad = True
+
+    def _get_text_model_root(module: torch.nn.Module) -> Optional[torch.nn.Module]:
+        root = getattr(module, "_model", module)
+        if hasattr(root, "text_model"):
+            return root.text_model
+        if hasattr(root, "model") and hasattr(root.model, "text_model"):
+            return root.model.text_model
+        return None
+
+    def _find_text_layers(text_model: torch.nn.Module):
+        candidate_chains = [
+            ("model", "layers"),
+            ("layers",),
+            ("encoder", "layers"),
+            ("decoder", "layers"),
+            ("transformer", "h"),
+        ]
+        for chain in candidate_chains:
+            cur = text_model
+            ok = True
+            for attr in chain:
+                if not hasattr(cur, attr):
+                    ok = False
+                    break
+                cur = getattr(cur, attr)
+            if ok and isinstance(cur, (torch.nn.ModuleList, list, tuple)) and len(cur) > 0:
+                return list(cur)
+        return None
+
+    train_top_layers = int(getattr(text_enc_cfg, "train_top_layers", 0) or 0)
+    train_final_norm = bool(getattr(text_enc_cfg, "train_final_norm", train_top_layers > 0))
+    train_embeddings = bool(getattr(text_enc_cfg, "train_embeddings", False))
+    text_model = _get_text_model_root(student.smolvlm2_model)
+    if train_top_layers > 0 and text_model is not None:
+        layers = _find_text_layers(text_model)
+        if layers:
+            top_layers = layers[-min(train_top_layers, len(layers)) :]
+            for layer in top_layers:
+                layer.requires_grad_(True)
+        if train_final_norm:
+            for norm_name in ("norm", "final_layernorm", "final_norm", "post_attention_layernorm"):
+                if hasattr(text_model, norm_name):
+                    getattr(text_model, norm_name).requires_grad_(True)
+        if train_embeddings and hasattr(text_model, "get_input_embeddings"):
+            emb = text_model.get_input_embeddings()
+            if emb is not None:
+                emb.requires_grad_(True)
 
     if student_cfg.get("vision_head_frozen", False) and getattr(student, "smolvlm2_vision_head", None) is not None:
         student.smolvlm2_vision_head.eval().requires_grad_(False)
@@ -719,6 +783,22 @@ def extract_lora_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return lora_state
 
 
+def extract_trainable_smolvlm2_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    trainable_names = {
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and ("lora_A" not in name and "lora_B" not in name)
+    }
+    if not trainable_names:
+        return {}
+    state_dict = model.state_dict()
+    return {
+        name: tensor.detach().cpu()
+        for name, tensor in state_dict.items()
+        if name in trainable_names
+    }
+
+
 def load_lora_state_dict(model: torch.nn.Module, lora_state: Dict[str, torch.Tensor], is_main: bool) -> None:
     if not lora_state:
         return
@@ -734,6 +814,23 @@ def load_lora_state_dict(model: torch.nn.Module, lora_state: Dict[str, torch.Ten
         loaded += 1
     if is_main:
         logger.info("Loaded LoRA params: loaded=%d missing=%d", loaded, missing)
+
+
+def load_trainable_smolvlm2_state_dict(model: torch.nn.Module, state: Dict[str, torch.Tensor], is_main: bool) -> None:
+    if not state:
+        return
+    named = dict(model.named_parameters())
+    loaded = 0
+    missing = 0
+    for name, tensor in state.items():
+        target = named.get(name)
+        if target is None:
+            missing += 1
+            continue
+        target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+        loaded += 1
+    if is_main:
+        logger.info("Loaded trainable SmolVLM2 params: loaded=%d missing=%d", loaded, missing)
 
 
 def get_trainable_dit_state_dict(diffusion_model: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -880,6 +977,7 @@ def deepspeed_zero_grad_compat(engine: torch.nn.Module) -> None:
 def build_student_checkpoint_state(student: torch.nn.Module, student_module: SanaPromptBridge) -> Dict[str, Any]:
     # Collect trainable student-side states (bridge blocks, gate, optional LoRA).
     lora_state = extract_lora_state_dict(student_module.smolvlm2_model)
+    trainable_text_state = extract_trainable_smolvlm2_state_dict(student_module.smolvlm2_model)
     if isinstance(student, FSDP):
         full_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(student, StateDictType.FULL_STATE_DICT, full_cfg):
@@ -895,6 +993,8 @@ def build_student_checkpoint_state(student: torch.nn.Module, student_module: San
         gate = full_state.get("adapter_output_gate")
         if gate is not None:
             student_state["adapter_output_gate"] = gate.detach().cpu()
+        if trainable_text_state:
+            student_state["smolvlm2_text_trainable"] = trainable_text_state
         if lora_state:
             student_state["smolvlm2_lora"] = lora_state
         return student_state
@@ -912,6 +1012,8 @@ def build_student_checkpoint_state(student: torch.nn.Module, student_module: San
         student_state["projector"] = student_module.projector.state_dict()
     if getattr(student_module, "smolvlm2_vision_head", None) is not None:
         student_state["smolvlm2_vision_head"] = student_module.smolvlm2_vision_head.state_dict()
+    if trainable_text_state:
+        student_state["smolvlm2_text_trainable"] = trainable_text_state
     if lora_state:
         student_state["smolvlm2_lora"] = lora_state
     return student_state
@@ -991,6 +1093,31 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     strict_sana_parity_text_path = bool(getattr(cfg.run, "strict_sana_parity_text_path", False))
     strict_fail_fast_mask = bool(getattr(cfg.run, "strict_fail_fast_mask", strict_sana_parity_text_path))
     sana_model_max_length = int(getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "model_max_length", 300) or 300)
+    checkpoint_load_path = args.resume_from or getattr(args, "init_from", None)
+    checkpoint_load_mode = "resume" if args.resume_from else ("init" if getattr(args, "init_from", None) else None)
+    load_log_prefix = "Resume" if checkpoint_load_mode == "resume" else "Init"
+    resume_ckpt = None
+    resume_student_state = None
+    resume_dit_state = None
+    resume_step = 0
+    resume_micro_step = 0
+    preloaded_dit_resume = False
+    if checkpoint_load_path:
+        if is_main:
+            logger.info("%s prewrap: torch.load checkpoint (start) path=%s", load_log_prefix, checkpoint_load_path)
+        resume_ckpt = torch.load(checkpoint_load_path, map_location="cpu")
+        resume_student_state = resume_ckpt.get("student_state", resume_ckpt)
+        resume_dit_state = resume_ckpt.get("dit_trainable_state")
+        resume_step = int(resume_ckpt.get("step", 0))
+        resume_micro_step = int(resume_ckpt.get("micro_step", 0))
+        if is_main:
+            logger.info(
+                "%s prewrap: torch.load checkpoint (done) step=%d micro_step=%d keys=%s",
+                load_log_prefix,
+                resume_step,
+                resume_micro_step,
+                sorted(list(resume_ckpt.keys())),
+            )
     if is_main and strict_sana_parity_text_path:
         logger.info(
             "Strict SANA-parity text path enabled: model_max_length=%d fail_fast_mask=%s",
@@ -1026,6 +1153,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     diffusion_model.to(device)
     if is_main:
         logger.info("Loaded SANA DiT checkpoint")
+        y_embedder = getattr(diffusion_model, "y_embedder", None)
+        uncond_prob = getattr(y_embedder, "uncond_prob", None) if y_embedder is not None else None
+        if uncond_prob is not None:
+            logger.info("SANA caption dropout: y_embedder.uncond_prob=%.4f", float(uncond_prob))
+        else:
+            logger.warning("Could not read SANA caption dropout: diffusion_model.y_embedder.uncond_prob is unavailable")
     # FSDP with this DiT stack is unstable with flash SDP + gradient checkpointing.
     # Prefer stable defaults for multi-GPU runs unless explicitly disabled in config.
     fsdp_disable_flash_sdp = bool(getattr(cfg.run, "fsdp_disable_flash_sdp", True))
@@ -1090,6 +1223,23 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             rank=rank,
             world_size=world_size,
         )
+    if resume_dit_state:
+        if is_main:
+            logger.info(
+                "%s prewrap: loading dit_trainable_state into unwrapped DiT (start) keys=%d",
+                load_log_prefix,
+                len(resume_dit_state),
+            )
+        missing, unexpected = diffusion_model.load_state_dict(resume_dit_state, strict=False)
+        preloaded_dit_resume = True
+        if is_main:
+            logger.info(
+                "%s prewrap: loading dit_trainable_state into unwrapped DiT (done) keys=%d missing=%d unexpected=%d",
+                load_log_prefix,
+                len(resume_dit_state),
+                len(missing),
+                len(unexpected),
+            )
     if use_dit_deepspeed and world_size > 1:
         if deepspeed is None:
             raise RuntimeError("model.dit.deepspeed=true but deepspeed is not installed in current environment.")
@@ -1220,6 +1370,22 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     elif world_size > 1:
         logger.info("Rank %s using manual gradient all-reduce for student (DDP disabled)", rank)
     student_module = student.module if isinstance(student, (DDP, FSDP)) else student
+    student_tokenizer = student_module._get_tokenizer()
+    student_tokenizer_cls = type(student_tokenizer).__name__
+    student_tokenizer_mod = type(student_tokenizer).__module__
+    student_tokenizer_name = getattr(student_tokenizer, "name_or_path", None)
+    if is_main:
+        logger.info(
+            "Bridge tokenizer: class=%s module=%s name_or_path=%s",
+            student_tokenizer_cls,
+            student_tokenizer_mod,
+            student_tokenizer_name,
+        )
+    if student_tokenizer_cls == "SimpleTokenizer":
+        raise RuntimeError(
+            "SimpleTokenizer fallback detected in training. "
+            "Please ensure HuggingFace tokenizer cache is available for SmolVLM2 tokenizer_model_id."
+        )
 
     # --------------------------
     # 2) Data + optimizer setup
@@ -1709,12 +1875,27 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     distill_teacher_store = None
     distill_precomputed = distill_cfg.get("precomputed", AttrDict())
     distill_precomputed_dir = str(getattr(distill_precomputed, "dir", "") or "")
+    distill_has_precomputed = bool(distill_precomputed_dir)
     distill_preload = bool(getattr(distill_precomputed, "preload", True))
     distill_max_cached_shards = int(getattr(distill_precomputed, "max_cached_shards", 2) or 2)
     distill_w_mse = float(getattr(distill_cfg, "token_mse_weight", 0.0) or 0.0)
     distill_w_cos = float(getattr(distill_cfg, "token_cos_weight", 0.0) or 0.0)
     distill_w_pool = float(getattr(distill_cfg, "pooled_cos_weight", 0.0) or 0.0)
     distill_use_mask = bool(getattr(distill_cfg, "use_attention_mask", True))
+    distill_every_steps = int(getattr(distill_cfg, "every_steps", 1) or 1)
+    if distill_every_steps < 1:
+        distill_every_steps = 1
+    distill_skip_missing = bool(getattr(distill_cfg, "skip_missing", False))
+    distill_missing_warn_every = int(getattr(distill_cfg, "missing_warn_every", 200) or 200)
+    distill_online_fallback = bool(getattr(distill_cfg, "online_fallback_on_missing", False))
+    distill_online_use_chi_prompt_cfg = getattr(distill_cfg, "online_use_chi_prompt", None)
+    if distill_online_use_chi_prompt_cfg is None:
+        distill_online_use_chi_prompt = False
+    else:
+        distill_online_use_chi_prompt = bool(distill_online_use_chi_prompt_cfg)
+    distill_online_teacher: Optional[SanaTextEncoder] = None
+    distill_online_fallback_count = 0
+    distill_missing_count = 0
     semantic_cfg = cfg.loss.get("semantic_probe", AttrDict())
     semantic_enabled = bool(getattr(semantic_cfg, "enabled", False))
     semantic_weight = float(getattr(semantic_cfg, "weight", 0.0) or 0.0)
@@ -1749,22 +1930,38 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             logger.warning("semantic_probe.geom_weight>0 but student_module has no encode_prompts(); geom term disabled.")
         semantic_geom_weight = 0.0
     if distill_enabled:
-        if not distill_precomputed_dir:
-            raise RuntimeError("distill.enabled=true but distill.precomputed.dir is empty")
-        distill_teacher_store = PrecomputedTeacherStore(
-            distill_precomputed_dir,
-            preload=distill_preload,
-            max_cached_shards=distill_max_cached_shards,
-        )
-        if is_main:
-            logger.info(
-                "Distill enabled: precomputed_dir=%s token_mse=%.3f token_cos=%.3f pooled_cos=%.3f preload=%s cache=%d",
+        if distill_has_precomputed:
+            distill_teacher_store = PrecomputedTeacherStore(
                 distill_precomputed_dir,
+                preload=distill_preload,
+                max_cached_shards=distill_max_cached_shards,
+            )
+        elif not distill_online_fallback:
+            raise RuntimeError(
+                "distill.enabled=true but distill.precomputed.dir is empty and "
+                "distill.online_fallback_on_missing=false. Provide a precomputed dir or enable online fallback."
+            )
+        if distill_online_fallback:
+            distill_online_teacher = SanaTextEncoder(sana_cfg, device=device, dtype=dtype)
+            distill_online_teacher.eval().requires_grad_(False)
+        if is_main:
+            distill_mode = "precomputed+online_fallback" if distill_has_precomputed and distill_online_fallback else (
+                "precomputed_only" if distill_has_precomputed else "online_only"
+            )
+            logger.info(
+                "Distill enabled: mode=%s precomputed_dir=%s token_mse=%.3f token_cos=%.3f pooled_cos=%.3f "
+                "every_steps=%d skip_missing=%s preload=%s cache=%d online_fallback=%s online_use_chi=%s",
+                distill_mode,
+                distill_precomputed_dir or "<none>",
                 distill_w_mse,
                 distill_w_cos,
                 distill_w_pool,
+                distill_every_steps,
+                distill_skip_missing,
                 distill_preload,
                 distill_max_cached_shards,
+                distill_online_fallback,
+                distill_online_use_chi_prompt,
             )
     if is_main and aux_start_step > 0:
         logger.info("Aux losses will be enabled from update_step >= %d", aux_start_step)
@@ -1914,6 +2111,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         "student_lora_enable": bool(getattr(student_lora_cfg, "enable", False)),
         "student_lora_r": int(getattr(student_lora_cfg, "r", 0) or 0),
         "student_lora_alpha": int(getattr(student_lora_cfg, "alpha", 0) or 0),
+        "student_text_train_top_layers": int(getattr(cfg.model.student.text_encoder, "train_top_layers", 0) or 0),
+        "student_text_train_final_norm": bool(getattr(cfg.model.student.text_encoder, "train_final_norm", False)),
         "dit_lora_enable": bool(getattr(dit_lora_cfg, "enable", False)),
         "dit_lora_r": int(getattr(dit_lora_cfg, "r", 0) or 0),
         "dit_lora_alpha": int(getattr(dit_lora_cfg, "alpha", 0) or 0),
@@ -1947,12 +2146,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
 
     if world_size > 1 and use_barrier:
         safe_barrier(local_rank)
-    resume_step = 0
-    resume_micro_step = 0
-    if args.resume_from:
-        # Resume model weights first; optimizer state is skipped for FSDP path.
-        ckpt = torch.load(args.resume_from, map_location="cpu")
-        state = ckpt.get("student_state", ckpt)
+    if checkpoint_load_path:
+        # Initialize model weights from checkpoint; true resume additionally restores step counters.
+        ckpt = resume_ckpt
+        state = resume_student_state if resume_student_state is not None else ckpt.get("student_state", ckpt)
+        if is_main:
+            logger.info("%s stage: loading student_state (start)", load_log_prefix)
         if isinstance(student, FSDP):
             with FSDP.summon_full_params(student, writeback=True, recurse=True):
                 if "adapter" in state and hasattr(student_module, "adapter"):
@@ -1969,6 +2168,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     student_module.projector.load_state_dict(state["projector"], strict=False)
                 if "smolvlm2_vision_head" in state and getattr(student_module, "smolvlm2_vision_head", None) is not None:
                     student_module.smolvlm2_vision_head.load_state_dict(state["smolvlm2_vision_head"], strict=False)
+                if "smolvlm2_text_trainable" in state:
+                    load_trainable_smolvlm2_state_dict(
+                        student_module.smolvlm2_model,
+                        state["smolvlm2_text_trainable"],
+                        is_main=is_main,
+                    )
                 if "smolvlm2_lora" in state:
                     load_lora_state_dict(student_module.smolvlm2_model, state["smolvlm2_lora"], is_main=is_main)
         else:
@@ -1986,11 +2191,21 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 student_module.projector.load_state_dict(state["projector"], strict=False)
             if "smolvlm2_vision_head" in state and getattr(student_module, "smolvlm2_vision_head", None) is not None:
                 student_module.smolvlm2_vision_head.load_state_dict(state["smolvlm2_vision_head"], strict=False)
+            if "smolvlm2_text_trainable" in state:
+                load_trainable_smolvlm2_state_dict(
+                    student_module.smolvlm2_model,
+                    state["smolvlm2_text_trainable"],
+                    is_main=is_main,
+                )
             if "smolvlm2_lora" in state:
                 load_lora_state_dict(student_module.smolvlm2_model, state["smolvlm2_lora"], is_main=is_main)
+        if is_main:
+            logger.info("%s stage: loading student_state (done)", load_log_prefix)
 
-        dit_state = ckpt.get("dit_trainable_state")
+        dit_state = None if preloaded_dit_resume else ckpt.get("dit_trainable_state")
         if dit_state:
+            if is_main:
+                logger.info("%s stage: loading dit_trainable_state (start) keys=%d", load_log_prefix, len(dit_state))
             if isinstance(diffusion_model, FSDP):
                 with FSDP.summon_full_params(diffusion_model, writeback=True, recurse=True):
                     dit_module = diffusion_model.module if hasattr(diffusion_model, "module") else diffusion_model
@@ -2005,53 +2220,60 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     len(missing),
                     len(unexpected),
                 )
+                logger.info("%s stage: loading dit_trainable_state (done)", load_log_prefix)
 
-        sharded_resume_mode = isinstance(student, FSDP) or isinstance(diffusion_model, FSDP) or bool(use_dit_deepspeed)
-        skip_resume_optim_state = bool(
-            getattr(args, "resume_skip_optimizer_state", False)
-            or getattr(cfg.run, "resume_skip_optimizer_state", False)
-        )
-        if sharded_resume_mode or skip_resume_optim_state:
+        if checkpoint_load_mode == "resume":
+            sharded_resume_mode = isinstance(student, FSDP) or isinstance(diffusion_model, FSDP) or bool(use_dit_deepspeed)
+            skip_resume_optim_state = bool(
+                getattr(args, "resume_skip_optimizer_state", False)
+                or getattr(cfg.run, "resume_skip_optimizer_state", False)
+            )
+            if sharded_resume_mode or skip_resume_optim_state:
+                if is_main:
+                    if sharded_resume_mode:
+                        logger.warning(
+                            "Sharded resume mode: skipping optimizer/scheduler state load due sharded "
+                            "state incompatibility. Model weights and step counters are restored."
+                        )
+                    else:
+                        logger.warning(
+                            "Resume configured to skip optimizer/scheduler state load "
+                            "(resume_skip_optimizer_state=True)."
+                        )
+            else:
+                if optimizer is not None and "optimizer" in ckpt:
+                    try:
+                        optimizer.load_state_dict(ckpt["optimizer"])
+                    except (ValueError, RuntimeError) as exc:
+                        if is_main:
+                            ckpt_groups = len(ckpt.get("optimizer", {}).get("param_groups", []))
+                            cur_groups = len(getattr(optimizer, "param_groups", []))
+                            logger.warning(
+                                "Skipping optimizer state load (likely trainable-params changed): %s "
+                                "(ckpt_groups=%d current_groups=%d)",
+                                str(exc),
+                                ckpt_groups,
+                                cur_groups,
+                            )
+                if scheduler is not None and "scheduler" in ckpt:
+                    try:
+                        scheduler.load_state_dict(ckpt["scheduler"])
+                    except (ValueError, RuntimeError) as exc:
+                        if is_main:
+                            logger.warning(
+                                "Skipping scheduler state load (resume mismatch): %s",
+                                str(exc),
+                            )
+
+            resume_step = int(ckpt.get("step", resume_step))
+            resume_micro_step = int(ckpt.get("micro_step", resume_micro_step))
             if is_main:
-                if sharded_resume_mode:
-                    logger.warning(
-                        "Sharded resume mode: skipping optimizer/scheduler state load due sharded "
-                        "state incompatibility. Model weights and step counters are restored."
-                    )
-                else:
-                    logger.warning(
-                        "Resume configured to skip optimizer/scheduler state load "
-                        "(resume_skip_optimizer_state=True)."
-                    )
+                logger.info("Resumed from %s at step=%d", checkpoint_load_path, resume_step)
         else:
-            if optimizer is not None and "optimizer" in ckpt:
-                try:
-                    optimizer.load_state_dict(ckpt["optimizer"])
-                except (ValueError, RuntimeError) as exc:
-                    if is_main:
-                        ckpt_groups = len(ckpt.get("optimizer", {}).get("param_groups", []))
-                        cur_groups = len(getattr(optimizer, "param_groups", []))
-                        logger.warning(
-                            "Skipping optimizer state load (likely trainable-params changed): %s "
-                            "(ckpt_groups=%d current_groups=%d)",
-                            str(exc),
-                            ckpt_groups,
-                            cur_groups,
-                        )
-            if scheduler is not None and "scheduler" in ckpt:
-                try:
-                    scheduler.load_state_dict(ckpt["scheduler"])
-                except (ValueError, RuntimeError) as exc:
-                    if is_main:
-                        logger.warning(
-                            "Skipping scheduler state load (resume mismatch): %s",
-                            str(exc),
-                        )
-
-        resume_step = int(ckpt.get("step", 0))
-        resume_micro_step = int(ckpt.get("micro_step", 0))
-        if is_main:
-            logger.info("Resumed from %s at step=%d", args.resume_from, resume_step)
+            resume_step = 0
+            resume_micro_step = 0
+            if is_main:
+                logger.info("Initialized model weights from %s (starting fresh at step=0)", checkpoint_load_path)
 
     if bridge_optimizer is not None:
         bridge_optimizer.zero_grad(set_to_none=True)
@@ -2114,6 +2336,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     # --------------------------
     while update_step < total_steps:
         loop_t0 = time.time()
+        is_first_logged_iter = bool(micro_step == 0 or micro_step == resume_micro_step)
         if sampler_video is not None:
             sampler_video.set_epoch(micro_step)
         if sampler_image is not None:
@@ -2135,7 +2358,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             use_image_step = False
         active_batch_modality = "image" if use_image_step else "video"
 
-        if is_main and micro_step == 0:
+        if is_main and is_first_logged_iter:
             logger.info("Entering training loop; waiting for first batch...")
         fetch_t0 = time.time()
         if use_image_step:
@@ -2153,7 +2376,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 batch = next(video_data_iter)
             video_micro_count += 1
         fetch_dt = time.time() - fetch_t0
-        if is_main and micro_step == 0:
+        if is_main and is_first_logged_iter:
             logger.info("First batch fetched in %.2fs (mode=%s)", fetch_dt, active_batch_modality)
 
         # Prompt path: dataset caption -> optional normalization/template/truncation.
@@ -2172,6 +2395,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 else:
                     prompts.append(p)
                     dropped_mask_list.append(False)
+        if is_first_logged_iter:
+            logger.info("Rank %s before student forward", rank)
         student_embeds_raw, student_prompt_mask = student(prompts, return_mask=True)
         if student_embeds_raw.dim() == 1:
             student_embeds_raw = student_embeds_raw.unsqueeze(0).unsqueeze(0)
@@ -2211,7 +2436,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     student_prompt_mask,
                 )
         student_fwd_dt = time.time() - fetch_t0 - fetch_dt
-        if micro_step == 0:
+        if is_first_logged_iter:
             logger.info("Rank %s reached student forward", rank)
         student_embeds_ln = F.layer_norm(student_embeds_raw, (student_embeds_raw.shape[-1],))
         student_embeds_for_dit = student_embeds_ln.to(dtype)
@@ -2223,18 +2448,100 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             raise RuntimeError(f"Unexpected student_embeds_for_dit shape: {tuple(student_embeds_for_dit.shape)}")
         teacher_embeds = None
         teacher_mask = None
-        if distill_enabled:
-            sample_idx = batch.get("sample_idx")
-            if sample_idx is None:
-                raise RuntimeError("distill enabled but batch missing sample_idx")
-            if not isinstance(sample_idx, torch.Tensor):
-                sample_idx = torch.tensor(sample_idx, dtype=torch.long)
-            teacher_embeds_cpu, teacher_mask_cpu = distill_teacher_store.fetch(sample_idx.cpu())
-            teacher_embeds = teacher_embeds_cpu.to(device=device, dtype=student_embeds_raw.dtype, non_blocking=True)
-            teacher_mask = teacher_mask_cpu.to(device=device, dtype=torch.long, non_blocking=True)
-            teacher_embeds, teacher_mask = pad_or_trim_teacher(
-                teacher_embeds, teacher_mask, student_embeds_raw.shape[1]
-            )
+        step_id = int(update_step + 1)
+        distill_run_this_step = bool(
+            distill_enabled
+            and step_id >= aux_start_step
+            and (step_id % distill_every_steps == 0)
+        )
+        if distill_run_this_step:
+            if distill_teacher_store is None:
+                if distill_online_teacher is None:
+                    raise RuntimeError("distill enabled but neither precomputed nor online teacher is available")
+                distill_online_fallback_count += 1
+                with torch.no_grad():
+                    teacher_out = distill_online_teacher.forward_chi(
+                        prompts_cond,
+                        use_chi_prompt=distill_online_use_chi_prompt,
+                    )
+                teacher_embeds = teacher_out["prompt_embeds"].to(
+                    device=device,
+                    dtype=student_embeds_raw.dtype,
+                    non_blocking=True,
+                )
+                teacher_mask = teacher_out["mask"].to(
+                    device=device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+                teacher_embeds, teacher_mask = pad_or_trim_teacher(
+                    teacher_embeds, teacher_mask, student_embeds_raw.shape[1]
+                )
+            else:
+                sample_idx = batch.get("sample_idx")
+                if sample_idx is None:
+                    raise RuntimeError("distill enabled but batch missing sample_idx")
+                if not isinstance(sample_idx, torch.Tensor):
+                    sample_idx = torch.tensor(sample_idx, dtype=torch.long)
+                try:
+                    teacher_embeds_cpu, teacher_mask_cpu = distill_teacher_store.fetch(sample_idx.cpu())
+                except KeyError as exc:
+                    if not distill_skip_missing and not distill_online_fallback:
+                        raise
+                    distill_missing_count += 1
+                    should_warn = bool(
+                        is_main
+                        and (
+                            distill_missing_count <= 5
+                            or (distill_missing_warn_every > 0 and distill_missing_count % distill_missing_warn_every == 0)
+                        )
+                    )
+                    if distill_online_fallback and distill_online_teacher is not None:
+                        distill_online_fallback_count += 1
+                        if should_warn:
+                            logger.warning(
+                                "Distill teacher missing for batch sample_idx=%s (missing_count=%d); "
+                                "using online teacher fallback (fallback_count=%d). err=%s",
+                                sample_idx.detach().cpu().tolist(),
+                                distill_missing_count,
+                                distill_online_fallback_count,
+                                str(exc),
+                            )
+                        with torch.no_grad():
+                            teacher_out = distill_online_teacher.forward_chi(
+                                prompts_cond,
+                                use_chi_prompt=distill_online_use_chi_prompt,
+                            )
+                        teacher_embeds = teacher_out["prompt_embeds"].to(
+                            device=device,
+                            dtype=student_embeds_raw.dtype,
+                            non_blocking=True,
+                        )
+                        teacher_mask = teacher_out["mask"].to(
+                            device=device,
+                            dtype=torch.long,
+                            non_blocking=True,
+                        )
+                        teacher_embeds, teacher_mask = pad_or_trim_teacher(
+                            teacher_embeds, teacher_mask, student_embeds_raw.shape[1]
+                        )
+                    else:
+                        if should_warn:
+                            logger.warning(
+                                "Distill teacher missing for batch sample_idx=%s (missing_count=%d); "
+                                "skipping distill on this batch. err=%s",
+                                sample_idx.detach().cpu().tolist(),
+                                distill_missing_count,
+                                str(exc),
+                            )
+                        teacher_embeds = None
+                        teacher_mask = None
+                else:
+                    teacher_embeds = teacher_embeds_cpu.to(device=device, dtype=student_embeds_raw.dtype, non_blocking=True)
+                    teacher_mask = teacher_mask_cpu.to(device=device, dtype=torch.long, non_blocking=True)
+                    teacher_embeds, teacher_mask = pad_or_trim_teacher(
+                        teacher_embeds, teacher_mask, student_embeds_raw.shape[1]
+                    )
 
         # Use prompt mask from student tokenizer/bridge (important for variable-length prompts).
         if student_prompt_mask is None:
@@ -2297,7 +2604,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             infer_hints["train_frame_num"] = int(observed_train_frame_num)
             if is_main:
                 logger.info("Observed train frame_num=%d", observed_train_frame_num)
-        if is_main and micro_step == 0:
+        if is_main and is_first_logged_iter:
             logger.info("Latent shape %s dtype=%s", tuple(latents.shape), latents.dtype)
 
         # Optional temporal/spatial windowing to reduce activation memory.
@@ -2472,7 +2779,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         cond_y_token_norm = student_embeds_for_dit.float().norm(dim=-1)
         cond_y_norm_mean = float(cond_y_token_norm.mean().item())
         cond_y_norm_std = float(cond_y_token_norm.std(unbiased=False).item())
-        if micro_step == 0:
+        if is_first_logged_iter:
             logger.info("Rank %s before SANA training_losses forward", rank)
         loss_term = sana_train_diffusion.training_losses(
             diffusion_model,
@@ -2482,7 +2789,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             timestep_weight=timestep_weight,
         )
         dit_fwd_dt = time.time() - fetch_t0 - fetch_dt - student_fwd_dt
-        if micro_step == 0:
+        if is_first_logged_iter:
             logger.info("Rank %s after SANA training_losses forward", rank)
         # Primary objective from SANA scheduler (flow/diffusion depending on config).
         diff_loss = loss_term["loss"].mean()
@@ -3244,6 +3551,12 @@ def main():
     parser.add_argument("--max-gpus", type=int, default=1)
     parser.add_argument("--resume-from", type=str, default=None, help="Resume training from checkpoint path")
     parser.add_argument(
+        "--init-from",
+        type=str,
+        default=None,
+        help="Initialize model weights from checkpoint path but start training fresh at step 0.",
+    )
+    parser.add_argument(
         "--resume-skip-optimizer-state",
         action="store_true",
         help="Skip loading optimizer/scheduler state when resuming (useful for debug resume or trainable-set changes).",
@@ -3260,6 +3573,8 @@ def main():
         help="Physical GPU id to use in --single-gpu-debug mode (sets CUDA_VISIBLE_DEVICES).",
     )
     args = parser.parse_args()
+    if args.resume_from and args.init_from:
+        raise RuntimeError("--resume-from and --init-from are mutually exclusive; choose one.")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     # This warning is non-fatal (layout/perf hint) and can spam distributed logs heavily.

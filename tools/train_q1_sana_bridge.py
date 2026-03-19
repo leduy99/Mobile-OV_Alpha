@@ -39,8 +39,6 @@ from nets.omni.modules.sana_prompt_bridge import SanaPromptBridge
 from nets.third_party.sana.diffusion.longsana.utils.model_wrapper import SanaTextEncoder
 from diffusion.utils.config import SanaVideoConfig, model_video_init_config
 from diffusion.model.builder import build_model
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -455,6 +453,14 @@ def load_source_dataset(source_cfg: AttrDict, streaming: bool) -> Any:
         if source_cfg.get("native_json", False):
             return JsonFileDataset(files)
         return load_dataset("json", data_files=files, split="train", streaming=streaming)
+    if source_type in ("csv", "manifest_csv"):
+        if os.path.isfile(path):
+            files = [path]
+        else:
+            files = find_files(path, (".csv",))
+        if not files:
+            raise FileNotFoundError(f"No csv files found in {path}")
+        return CsvFileDataset(files)
     raise ValueError(f"Unsupported data source type: {source_type}")
 
 
@@ -575,6 +581,19 @@ class JsonFileDataset(IterableDataset):
                                     yield item
 
 
+class CsvFileDataset(IterableDataset):
+    def __init__(self, files: List[str], chunksize: int = 8192):
+        super().__init__()
+        self.files = files
+        self.chunksize = int(max(1, chunksize))
+
+    def __iter__(self):
+        for file_path in self.files:
+            for chunk in pd.read_csv(file_path, chunksize=self.chunksize):
+                for row in chunk.to_dict("records"):
+                    yield row
+
+
 def build_data_info(batch_size: int, height: int, width: int, device: torch.device) -> Dict[str, torch.Tensor]:
     img_hw = torch.tensor([[height, width]], device=device, dtype=torch.float)
     return {"img_hw": img_hw.repeat(batch_size, 1)}
@@ -680,9 +699,22 @@ def build_prompt_batch(
 
 
 def train_with_config(cfg: AttrDict, args: argparse.Namespace):
+    from tools.train_stage1_teacher_free import (
+        build_student as build_teacher_free_student,
+        build_student_checkpoint_state,
+        ensure_sana_assets_available,
+        ensure_smolvlm2_checkpoint_available,
+        load_lora_state_dict,
+        load_trainable_smolvlm2_state_dict,
+    )
+
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("HF_HOME", "/share_4/users/duy/.cache/huggingface")
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", "/share_4/users/duy/.cache/huggingface")
+    hf_home = str(getattr(cfg.run, "hf_home", "") or "").strip()
+    hf_cache = str(getattr(cfg.run, "huggingface_hub_cache", "") or "").strip()
+    if hf_home:
+        os.environ.setdefault("HF_HOME", hf_home)
+    if hf_cache:
+        os.environ.setdefault("HUGGINGFACE_HUB_CACHE", hf_cache)
 
     rank, world_size, local_rank = init_distributed(args.max_gpus)
     is_main = rank == 0
@@ -717,38 +749,74 @@ def train_with_config(cfg: AttrDict, args: argparse.Namespace):
     else:
         sana_ckpt_dir = cfg.sana.dit_ckpt or cfg.sana.get("ckpt_dir", "omni_ckpts/sana_video_2b_480p")
 
+    auto_download_pretrained = bool(getattr(cfg.run, "auto_download_pretrained", True))
+    auto_download_sana = bool(getattr(cfg.run, "auto_download_sana", auto_download_pretrained))
+    auto_download_smol = bool(getattr(cfg.run, "auto_download_smolvlm2", auto_download_pretrained))
+    smol_ckpt_path = str(cfg.model.student.text_encoder.ckpt_path)
+
+    if auto_download_sana:
+        ensure_sana_assets_available(
+            sana_cfg=sana_cfg,
+            sana_ckpt_dir=sana_ckpt_dir,
+            is_main=is_main,
+            local_rank=local_rank,
+        )
+    if auto_download_smol:
+        ensure_smolvlm2_checkpoint_available(
+            ckpt_path=smol_ckpt_path,
+            is_main=is_main,
+            local_rank=local_rank,
+        )
+
     teacher = SanaTextEncoder(sana_cfg, device=device, dtype=dtype)
 
     student_cfg = cfg.model.student
-    bridge_cfg = student_cfg.conditioner_bridge
-    student = SanaPromptBridge(
-        smolvlm2_ckpt_path=student_cfg.text_encoder.ckpt_path,
-        adapter_ckpt_dir=cfg.model.student.get("adapter_ckpt_dir", "omni_ckpts/wan/wanxiang1_3b/adapter"),
-        adapter_in_channels=cfg.model.student.get("adapter_in_channels", 1152),
-        adapter_out_channels=cfg.model.student.get("adapter_out_channels", 4096),
-        adapter_query_length=cfg.model.student.get("adapter_query_length", 64),
-        smol_vh_num_queries=cfg.model.student.get("smol_vh_num_queries", 1),
-        num_prompt_queries=bridge_cfg.out_seq_len,
-        caption_channels=bridge_cfg.out_dim,
-        precision_dtype=dtype,
-        device=device,
-        tokenizer_model_id=student_cfg.text_encoder.get("tokenizer_model_id", "HuggingFaceTB/SmolVLM-Instruct"),
-        force_adapter_query_length=cfg.model.student.get("force_adapter_query_length"),
-        max_length=student_cfg.text_encoder.max_length,
+    strict_sana_parity = bool(getattr(cfg.run, "strict_sana_parity_text_path", False))
+    strict_fail_fast_mask = bool(getattr(cfg.run, "strict_fail_fast_mask", strict_sana_parity))
+    sana_model_max_length = int(getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "model_max_length", 300) or 300)
+    chi_prompt_text = ""
+    if bool(getattr(cfg.data.preprocessing, "use_chi_prompt", False)):
+        chi_list = getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "chi_prompt", None)
+        if isinstance(chi_list, (list, tuple)) and len(chi_list) > 0:
+            chi_prompt_text = "\n".join(str(x) for x in chi_list)
+
+    student = build_teacher_free_student(
+        cfg,
+        device,
+        dtype,
+        strict_sana_parity_text_path=strict_sana_parity,
+        strict_fail_fast_mask=strict_fail_fast_mask,
+        sana_model_max_length=sana_model_max_length,
+        sana_chi_prompt_text=chi_prompt_text,
     )
-
-    if student_cfg.text_encoder.frozen:
-        student.smolvlm2_model.eval().requires_grad_(False)
-    else:
-        student.smolvlm2_model.train().requires_grad_(True)
-
-    if student_cfg.get("vision_head_frozen", False):
-        student.smolvlm2_vision_head.eval().requires_grad_(False)
 
     if world_size > 1:
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
     student_module = student.module if isinstance(student, DDP) else student
+    projector_cfg = cfg.model.student.get("projector", AttrDict())
+    student_lora_cfg = cfg.model.student.get("lora", AttrDict())
+    infer_hints = {
+        "projector_type": str(getattr(projector_cfg, "type", "legacy")),
+        "mcp_hidden_dim": int(getattr(projector_cfg, "mcp_hidden_dim", 512) or 512),
+        "mcp_num_fuse_layers": int(getattr(projector_cfg, "mcp_num_fuse_layers", 4) or 4),
+        "mcp_use_refine": bool(getattr(projector_cfg, "mcp_use_refine", False)),
+        "mcp_refine_kernel_size": int(getattr(projector_cfg, "mcp_refine_kernel_size", 3) or 3),
+        "student_lora_enable": bool(getattr(student_lora_cfg, "enable", False)),
+        "student_lora_r": int(getattr(student_lora_cfg, "r", 0) or 0),
+        "student_lora_alpha": int(getattr(student_lora_cfg, "alpha", 0) or 0),
+        "student_text_train_top_layers": int(getattr(cfg.model.student.text_encoder, "train_top_layers", 0) or 0),
+        "student_text_train_final_norm": bool(getattr(cfg.model.student.text_encoder, "train_final_norm", False)),
+        "train_use_chi_prompt": bool(getattr(cfg.data.preprocessing, "use_chi_prompt", False)),
+        "train_use_prompt_templates": False,
+        "train_motion_score": int(getattr(cfg.data.preprocessing, "motion_score", 0) or 0),
+        "strict_sana_parity_text_path": strict_sana_parity,
+        "strict_fail_fast_mask": strict_fail_fast_mask,
+        "sana_model_max_length": sana_model_max_length,
+        "train_student_max_length": int(getattr(cfg.model.student.text_encoder, "max_length", 0) or 0),
+        "stage1_prompt_only_distill": True,
+        "teacher_name": str(getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "text_encoder_name", "unknown")),
+    }
 
     diffusion_model = None
     if cfg.loss.effect.enabled or cfg.loss.cfg.enabled:
@@ -836,11 +904,22 @@ def train_with_config(cfg: AttrDict, args: argparse.Namespace):
     if args.resume_from:
         ckpt = torch.load(args.resume_from, map_location="cpu")
         state = ckpt.get("student_state", ckpt)
-        student_module.smolvlm2_vision_head.load_state_dict(state["smolvlm2_vision_head"])
-        student_module.adapter.load_state_dict(state["adapter"], strict=False)
-        student_module.adapter_output_norm.load_state_dict(state["adapter_output_norm"])
-        student_module.adapter_output_gate.data.copy_(state["adapter_output_gate"])
-        student_module.resampler.load_state_dict(state["resampler"])
+        if "smolvlm2_vision_head" in state and getattr(student_module, "smolvlm2_vision_head", None) is not None:
+            student_module.smolvlm2_vision_head.load_state_dict(state["smolvlm2_vision_head"], strict=False)
+        if "adapter" in state and hasattr(student_module, "adapter"):
+            student_module.adapter.load_state_dict(state["adapter"], strict=False)
+        if "adapter_output_norm" in state and hasattr(student_module, "adapter_output_norm"):
+            student_module.adapter_output_norm.load_state_dict(state["adapter_output_norm"], strict=False)
+        if "adapter_output_gate" in state:
+            student_module.adapter_output_gate.data.copy_(state["adapter_output_gate"].to(student_module.adapter_output_gate.device))
+        if "resampler" in state and hasattr(student_module, "resampler"):
+            student_module.resampler.load_state_dict(state["resampler"], strict=False)
+        if "projector" in state and getattr(student_module, "projector", None) is not None:
+            student_module.projector.load_state_dict(state["projector"], strict=False)
+        if "smolvlm2_text_trainable" in state:
+            load_trainable_smolvlm2_state_dict(student_module.smolvlm2_model, state["smolvlm2_text_trainable"], is_main=is_main)
+        if "smolvlm2_lora" in state:
+            load_lora_state_dict(student_module.smolvlm2_model, state["smolvlm2_lora"], is_main=is_main)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
             move_optimizer_state_to_device(optimizer, device)
@@ -1084,19 +1163,15 @@ def train_with_config(cfg: AttrDict, args: argparse.Namespace):
 
         if is_main and save_every and (global_step + 1) % save_every == 0:
             ckpt_path = os.path.join(run_dir, f"checkpoint_step{global_step + 1}.pt")
-            student_state = {
-                "smolvlm2_vision_head": student_module.smolvlm2_vision_head.state_dict(),
-                "adapter": student_module.adapter.state_dict(),
-                "adapter_output_norm": student_module.adapter_output_norm.state_dict(),
-                "adapter_output_gate": student_module.adapter_output_gate.detach().cpu(),
-                "resampler": student_module.resampler.state_dict(),
-            }
+            student_state = build_student_checkpoint_state(student, student_module)
             torch.save(
                 {
                     "step": global_step + 1,
                     "student_state": student_state,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                    "infer_hints": infer_hints,
+                    "stage_name": "stage1_prompt_only_distill",
                 },
                 ckpt_path,
             )
@@ -1106,19 +1181,15 @@ def train_with_config(cfg: AttrDict, args: argparse.Namespace):
 
     if is_main:
         final_ckpt = os.path.join(run_dir, "checkpoint_final.pt")
-        student_state = {
-            "smolvlm2_vision_head": student_module.smolvlm2_vision_head.state_dict(),
-            "adapter": student_module.adapter.state_dict(),
-            "adapter_output_norm": student_module.adapter_output_norm.state_dict(),
-            "adapter_output_gate": student_module.adapter_output_gate.detach().cpu(),
-            "resampler": student_module.resampler.state_dict(),
-        }
+        student_state = build_student_checkpoint_state(student, student_module)
         torch.save(
             {
                 "step": global_step,
                 "student_state": student_state,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
+                "infer_hints": infer_hints,
+                "stage_name": "stage1_prompt_only_distill",
             },
             final_ckpt,
         )

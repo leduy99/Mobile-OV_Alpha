@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.egg-info/
 
 # Local environments and IDE
 .venv/
@@ -18,7 +19,11 @@ output/
 # Datasets and downloaded media
 data/
 data_stage1/
-download_data/
+download_data/data/*
+!download_data/data/.gitkeep
+download_data/checkpoints/*
+!download_data/checkpoints/.gitkeep
+download_data/**/__pycache__/
 
 # Checkpoints and model caches
 omni_ckpts/

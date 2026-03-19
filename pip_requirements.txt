@@ -146,7 +146,8 @@ regex==2024.11.6
 requests==2.32.3
 rich==13.9.4
 ruff==0.9.10
-s2wrapper @ file:///cpfs01/projects-HDD/cfff-01ff502a0784_HDD/public/yanghao/software/scaling_on_scales
+# Optional legacy dependency for VILA / multiscale vision paths only.
+# It is intentionally excluded from the canonical train/infer environment.
 s3transfer==0.11.4
 safehttpx==0.1.6
 safetensors==0.5.3
@@ -190,5 +191,6 @@ xformers==0.0.29.post3
 xfuser==0.4.3.post3
 xxhash==3.5.0
 yarl==1.18.3
+yt-dlp
 yunchang==0.6.3.post1
 zipp==3.21.0

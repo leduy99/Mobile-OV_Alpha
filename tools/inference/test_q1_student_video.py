@@ -51,9 +51,9 @@ def main():
     parser.add_argument(
         "--sana-backend",
         type=str,
-        default="legacy",
+        default="fixed",
         choices=["legacy", "fixed"],
-        help="Choose SANA inference backend module.",
+        help="Choose SANA inference backend module. Use 'fixed' unless you are intentionally debugging legacy sampling.",
     )
     parser.add_argument("--csv-path", type=str, default="data/openvid_q1/OpenVid_prompt_subset.csv")
     parser.add_argument("--prompt-index", type=int, default=0, help="Prompt index in CSV")
@@ -135,7 +135,27 @@ def main():
         # Loader from old script is brittle with current registry/config layout.
         # Keep legacy sampler path, but use fixed backend for robust model bootstrap.
         runtime_backend = _load_sana_inference_backend("fixed")
+        print("WARNING: using legacy sampling path for debugging only; current results may be unreliable.")
     print(f"SANA backend: {args.sana_backend}")
+    print(
+        "Infer request: backend=%s device=%s dtype=%s seed=%d steps=%d cfg_scale=%.4f "
+        "sampling_algo_arg=%s flow_shift_arg=%s bridge_ckpt=%s"
+        % (
+            args.sana_backend,
+            str(device),
+            args.dtype,
+            int(args.seed),
+            int(args.steps),
+            float(args.cfg_scale),
+            (args.sampling_algo if args.sampling_algo is not None else "auto"),
+            (str(args.flow_shift) if args.flow_shift is not None else "auto"),
+            str(args.bridge_ckpt),
+        )
+    )
+
+    if not os.path.exists(args.checkpoint_dir) and hasattr(runtime_backend, "download_checkpoint"):
+        print(f"SANA checkpoint dir missing, auto-downloading to: {args.checkpoint_dir}")
+        runtime_backend.download_checkpoint(local_dir=args.checkpoint_dir)
 
     if args.prompt is not None and str(args.prompt).strip():
         prompt = str(args.prompt).strip()
@@ -345,6 +365,19 @@ def main():
         lora_alpha=lora_alpha,
         lora_dropout=args.lora_dropout,
     )
+    bridge_tokenizer = bridge._get_tokenizer()
+    bridge_tokenizer_cls = type(bridge_tokenizer).__name__
+    bridge_tokenizer_mod = type(bridge_tokenizer).__module__
+    bridge_tokenizer_name = getattr(bridge_tokenizer, "name_or_path", None)
+    print(
+        "Bridge tokenizer: class=%s module=%s name_or_path=%s"
+        % (bridge_tokenizer_cls, bridge_tokenizer_mod, bridge_tokenizer_name)
+    )
+    if bridge_tokenizer_cls == "SimpleTokenizer":
+        raise RuntimeError(
+            "SimpleTokenizer fallback detected in inference. "
+            "Please ensure HuggingFace tokenizer cache is available for SmolVLM2 tokenizer_model_id."
+        )
 
     print(
         f"Inference settings: projector_type={projector_type} "
@@ -381,6 +414,16 @@ def main():
             print("WARNING: No DiT trainable keys were loaded. Check LoRA injection / target modules.")
     if "smolvlm2_vision_head" in state and getattr(bridge, "smolvlm2_vision_head", None) is not None:
         bridge.smolvlm2_vision_head.load_state_dict(state["smolvlm2_vision_head"])
+    if "smolvlm2_text_trainable" in state:
+        named = dict(bridge.smolvlm2_model.named_parameters())
+        loaded = 0
+        for name, tensor in state["smolvlm2_text_trainable"].items():
+            target = named.get(name)
+            if target is None:
+                continue
+            target.data.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded += 1
+        print(f"Loaded trainable SmolVLM2 params from checkpoint: {loaded}")
     if "smolvlm2_lora" in state:
         named = dict(bridge.smolvlm2_model.named_parameters())
         loaded = 0
@@ -625,6 +668,28 @@ def main():
         print(f"Flow shift: train={float(train_flow_shift):.4f}, infer={infer_flow_shift:.4f}")
     else:
         print(f"Flow shift: infer={infer_flow_shift:.4f}")
+    print(
+        "Sampling parameters: backend=%s seed=%d steps=%d cfg_scale=%.4f flow_shift=%.4f "
+        "sampling_algo=%s num_frames=%d latent_shape=%s height=%d width=%d "
+        "negative_prompt_len=%d motion_score=%d use_chi_prompt=%s prompt_index=%d"
+        % (
+            args.sana_backend,
+            int(args.seed),
+            int(args.steps),
+            float(args.cfg_scale),
+            float(infer_flow_shift),
+            str(sampling_algo),
+            int(num_frames),
+            tuple(int(v) for v in latent_shape),
+            int(height),
+            int(width),
+            len(args.negative_prompt or ""),
+            int(args.motion_score),
+            bool(use_chi_prompt),
+            int(args.prompt_index),
+        )
+    )
+    print(f"Prompt text: {prompt_plain}")
 
     if args.sana_backend == "legacy":
         # Legacy path mirrors old sana_video_inference.py behavior.
