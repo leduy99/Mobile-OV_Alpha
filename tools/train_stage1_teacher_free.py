@@ -414,6 +414,20 @@ def compute_masked_token_cos(student: torch.Tensor, teacher: torch.Tensor, mask:
     return 1.0 - ((cos * mask_f).sum() / denom)
 
 
+def extract_diffusion_tensor(output: Any) -> torch.Tensor:
+    if isinstance(output, torch.Tensor):
+        return output
+    if isinstance(output, dict):
+        if isinstance(output.get("x"), torch.Tensor):
+            return output["x"]
+        if isinstance(output.get("sample"), torch.Tensor):
+            return output["sample"]
+    if isinstance(output, (tuple, list)) and output:
+        if isinstance(output[0], torch.Tensor):
+            return output[0]
+    raise TypeError(f"Unsupported diffusion output type: {type(output)}")
+
+
 def compute_prompt_anticollapse_losses(
     pooled: torch.Tensor,
     target_std: float = 1.0,
@@ -1896,6 +1910,19 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     distill_online_teacher: Optional[SanaTextEncoder] = None
     distill_online_fallback_count = 0
     distill_missing_count = 0
+    functional_cfg = cfg.loss.get("functional", AttrDict())
+    functional_enabled = bool(getattr(functional_cfg, "enabled", False))
+    functional_pred_mse_weight = float(getattr(functional_cfg, "pred_mse_weight", 0.0) or 0.0)
+    functional_pred_cos_weight = float(getattr(functional_cfg, "pred_cos_weight", 0.0) or 0.0)
+    functional_every_steps = int(getattr(functional_cfg, "every_steps", 1) or 1)
+    if functional_every_steps < 1:
+        functional_every_steps = 1
+    if functional_enabled and functional_pred_mse_weight <= 0.0 and functional_pred_cos_weight <= 0.0:
+        if is_main:
+            logger.warning(
+                "functional distill disabled because pred_mse_weight and pred_cos_weight are both zero."
+            )
+        functional_enabled = False
     semantic_cfg = cfg.loss.get("semantic_probe", AttrDict())
     semantic_enabled = bool(getattr(semantic_cfg, "enabled", False))
     semantic_weight = float(getattr(semantic_cfg, "weight", 0.0) or 0.0)
@@ -1963,6 +1990,13 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 distill_online_fallback,
                 distill_online_use_chi_prompt,
             )
+    if functional_enabled and is_main:
+        logger.info(
+            "Functional distill enabled: pred_mse=%.3f pred_cos=%.3f every_steps=%d",
+            functional_pred_mse_weight,
+            functional_pred_cos_weight,
+            functional_every_steps,
+        )
     if is_main and aux_start_step > 0:
         logger.info("Aux losses will be enabled from update_step >= %d", aux_start_step)
 
@@ -2454,10 +2488,18 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             and step_id >= aux_start_step
             and (step_id % distill_every_steps == 0)
         )
-        if distill_run_this_step:
+        functional_run_this_step = bool(
+            functional_enabled
+            and step_id >= aux_start_step
+            and (step_id % functional_every_steps == 0)
+        )
+        teacher_supervision_run_this_step = bool(distill_run_this_step or functional_run_this_step)
+        if teacher_supervision_run_this_step:
             if distill_teacher_store is None:
                 if distill_online_teacher is None:
-                    raise RuntimeError("distill enabled but neither precomputed nor online teacher is available")
+                    raise RuntimeError(
+                        "teacher supervision enabled but neither precomputed nor online teacher is available"
+                    )
                 distill_online_fallback_count += 1
                 with torch.no_grad():
                     teacher_out = distill_online_teacher.forward_chi(
@@ -2995,6 +3037,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         distill_mse_loss = torch.tensor(0.0, device=device)
         distill_cos_loss = torch.tensor(0.0, device=device)
         distill_pooled_loss = torch.tensor(0.0, device=device)
+        functional_pred_mse_loss = torch.tensor(0.0, device=device)
+        functional_pred_cos_loss = torch.tensor(0.0, device=device)
         if aux_active and distill_enabled and teacher_embeds is not None:
             student_distill = F.layer_norm(student_embeds_raw.float(), (student_embeds_raw.shape[-1],))
             teacher_distill = F.layer_norm(teacher_embeds.float(), (teacher_embeds.shape[-1],))
@@ -3011,6 +3055,42 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 pooled_student = masked_mean_pool(student_distill, dmask_pool)
                 pooled_teacher = masked_mean_pool(teacher_distill, dmask_pool)
                 distill_pooled_loss = 1.0 - F.cosine_similarity(pooled_student, pooled_teacher, dim=-1).mean()
+        if aux_active and functional_run_this_step and teacher_embeds is not None:
+            teacher_embeds_for_dit = teacher_embeds.to(device=device, dtype=dtype, non_blocking=True)
+            if teacher_mask is None:
+                teacher_mask_for_dit = torch.ones(
+                    teacher_embeds_for_dit.shape[:2], device=device, dtype=torch.long
+                )
+            else:
+                teacher_mask_for_dit = teacher_mask.to(device=device, dtype=torch.long)
+                if teacher_mask_for_dit.dim() == 1:
+                    teacher_mask_for_dit = teacher_mask_for_dit.unsqueeze(0)
+            if teacher_mask_for_dit.dim() == 2:
+                teacher_mask_for_dit = teacher_mask_for_dit.unsqueeze(1).unsqueeze(1)
+            teacher_model_kwargs = {
+                "mask": teacher_mask_for_dit,
+                "data_info": data_info,
+            }
+            if chunk_index is not None:
+                teacher_model_kwargs["chunk_index"] = chunk_index
+            student_model_pred = extract_diffusion_tensor(loss_term["output"]).float()
+            with torch.no_grad():
+                teacher_model_pred = extract_diffusion_tensor(
+                    diffusion_model(
+                        noisy_for_cfg,
+                        timesteps,
+                        teacher_embeds_for_dit.unsqueeze(1),
+                        **teacher_model_kwargs,
+                    )
+                ).float()
+            if functional_pred_mse_weight > 0.0:
+                functional_pred_mse_loss = F.mse_loss(student_model_pred, teacher_model_pred)
+            if functional_pred_cos_weight > 0.0:
+                functional_pred_cos_loss = 1.0 - F.cosine_similarity(
+                    student_model_pred.reshape(student_model_pred.shape[0], -1),
+                    teacher_model_pred.reshape(teacher_model_pred.shape[0], -1),
+                    dim=-1,
+                ).mean()
 
         semantic_var_loss = torch.tensor(0.0, device=device)
         semantic_cov_loss = torch.tensor(0.0, device=device)
@@ -3078,6 +3158,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 + distill_w_mse * distill_mse_loss
                 + distill_w_cos * distill_cos_loss
                 + distill_w_pool * distill_pooled_loss
+                + functional_pred_mse_weight * functional_pred_mse_loss
+                + functional_pred_cos_weight * functional_pred_cos_loss
                 + semantic_weight
                 * (
                     semantic_var_weight * semantic_var_loss
@@ -3364,6 +3446,11 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 log_line += " cond_pred_l2=%.6f cond_pred_ratio=%.6f" % (
                     cond_pred_delta_l2,
                     cond_pred_delta_ratio,
+                )
+            if functional_enabled:
+                log_line += " f_pred_mse=%.6f f_pred_cos=%.6f" % (
+                    functional_pred_mse_loss.item(),
+                    functional_pred_cos_loss.item(),
                 )
             if semantic_enabled:
                 log_line += " sem_var=%.6f sem_cov=%.6f sem_geom=%.6f" % (
