@@ -3,6 +3,10 @@
 This guide is the canonical setup document for the cleaned training / inference
 scope of this repository.
 
+If you want one file that covers the full onboarding path from repo setup to
+dataset preparation to training to inference, start with:
+- `docs/END_TO_END_GUIDE.md`
+
 ## Scope
 
 The supported workflows in this guide are:
@@ -147,8 +151,7 @@ Notes:
 
 ### OpenVid
 For a robust OpenVid workflow, use the bundled DataOps package:
-- `download_data/README.md`
-- `OPENVID_TRAINING_GUIDE.md`
+- `download_data/README.md` (step-by-step guide)
 
 ### LAION / COYO
 The current workflow is manifest-based.
@@ -162,13 +165,17 @@ Canonical scripts:
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
 - `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
+- `tools/data_prepare/build_laion_coyo_encoded_manifest.py`
+
+See:
+- `docs/LAION_COYO_DATA_PREPARE.md` (step-by-step guide)
 
 ### MSR-VTT
 Canonical script:
 - `tools/data_prepare/msrvtt_data_prepare.py`
 
 See:
-- `tools/data_prepare/MSRVTT_DATA_PREPARE.md`
+- `tools/data_prepare/MSRVTT_DATA_PREPARE.md` (step-by-step guide)
 
 ## 7. Recommended Sanity Checks
 

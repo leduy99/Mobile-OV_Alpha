@@ -58,6 +58,18 @@ def main():
     parser.add_argument("--csv-path", type=str, default="data/openvid_q1/OpenVid_prompt_subset.csv")
     parser.add_argument("--prompt-index", type=int, default=0, help="Prompt index in CSV")
     parser.add_argument("--prompt", type=str, default=None, help="Direct prompt text (overrides CSV)")
+    parser.add_argument(
+        "--smolvlm2-ckpt-path",
+        type=str,
+        default=os.environ.get("SMOLVLM2_CKPT_PATH", "omni_ckpts/smolvlm2_500m/smolvlm2_500m.pt"),
+        help="Converted SmolVLM2 checkpoint used by the student bridge.",
+    )
+    parser.add_argument(
+        "--tokenizer-model-id",
+        type=str,
+        default=os.environ.get("SMOLVLM2_TOKENIZER_MODEL_ID", "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"),
+        help="Tokenizer/model id for the student bridge text path.",
+    )
     parser.add_argument("--checkpoint-dir", type=str, default="omni_ckpts/sana_video_2b_480p")
     parser.add_argument("--config", type=str, default="configs/sana_video_config/Sana_2000M_480px_AdamW_fsdp.yaml")
     parser.add_argument("--bridge-ckpt", type=str, required=True, help="Q1 bridge checkpoint")
@@ -332,7 +344,7 @@ def main():
 
     # Student embeddings via bridge
     bridge = SanaPromptBridge(
-        smolvlm2_ckpt_path="omni_ckpts/smolvlm2_500m/smolvlm2_500m.pt",
+        smolvlm2_ckpt_path=args.smolvlm2_ckpt_path,
         adapter_ckpt_dir=args.adapter_ckpt_dir,
         adapter_in_channels=args.adapter_in_channels,
         adapter_out_channels=args.adapter_out_channels,
@@ -360,6 +372,7 @@ def main():
         fail_fast_mask=hint_strict_fail_fast_mask,
         sana_model_max_length=hint_sana_model_max_length,
         sana_chi_prompt=chi_prompt_text,
+        tokenizer_model_id=args.tokenizer_model_id,
         lora_enable=lora_enable,
         lora_r=lora_r,
         lora_alpha=lora_alpha,

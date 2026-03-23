@@ -221,6 +221,99 @@ Examples of acceptable signs:
 
 If those signals do not improve, Stage 3 should be delayed.
 
+## What we saw by step 10k
+
+By the time the revised Stage 2 reached roughly 10k steps, the run still looked numerically healthy.
+
+Stable signs:
+- no NaNs or hard divergence,
+- gradients stayed finite,
+- embedding scale stayed stable,
+- the run continued cleanly on 2 GPUs.
+
+Loss behavior was mixed rather than uniformly good.
+
+What improved:
+- token-space distillation losses improved compared with the early part of the run,
+- functional DiT-response losses also improved,
+- total loss became lower on average than in the earliest training window.
+
+What did **not** improve:
+- diffusion loss did not show a clean downward trend,
+- it stayed noisy and in some windows looked slightly worse than earlier,
+- so better total loss mostly came from better teacher-matching, not better denoising quality.
+
+This matters because the revised Stage 2 objective is still dominated by teacher-relative matching terms.
+That means:
+- the run can look better in loss space,
+- while final video quality still fails to improve enough.
+
+## What inference said at 5k and 10k
+
+We directly compared checkpoint 5k and checkpoint 10k using the same clean fixed inference setup:
+- same backend,
+- same seed,
+- same resolution,
+- same number of frames,
+- same sampling settings.
+
+Two anchor prompts were used first:
+- `a golden retriever running along a beach at sunset, cinematic motion, gentle ocean waves`
+- `a chef slicing colorful vegetables in a bright kitchen, realistic hand motion, shallow depth of field`
+
+Direct qualitative result:
+- checkpoint 10k was **not** a convincing improvement over checkpoint 5k,
+- both checkpoints still produced largely abstract, weakly grounded outputs,
+- the chef prompt at 10k looked slightly less empty than at 5k,
+- but the golden retriever prompt still failed badly at both checkpoints,
+- there was no clear qualitative jump that matched the better loss curves.
+
+We also ran 4 additional prompts at checkpoint 10k:
+- cherry blossom blooming time-lapse,
+- snowy forest aerial view,
+- astronaut outside a space station,
+- violinist performing under a spotlight.
+
+Result:
+- all 4 were still poor,
+- the snowy forest prompt was the least bad because it retained the most scene-like structure,
+- but none of the 4 showed reliable prompt grounding.
+
+So by 10k, the practical reading is:
+- Stage 2 v2 is probably learning something useful about teacher-relative matching,
+- but that improvement has **not yet transferred** into clear video-quality gains.
+
+## Current interpretation after the 10k checkpoint
+
+The revised Stage 2 should **not** be judged a failure yet, but it also should **not** be treated as solved.
+
+Most likely interpretation:
+- the new objective is closer to the real bottleneck than the old Stage 2 objective,
+- but it is still not sufficient by itself to guarantee good generation quality by 5k or 10k.
+
+This is still compatible with the main diagnosis:
+- Stage 1 improved the conditioner,
+- Stage 2 is an interface-calibration problem,
+- and functional matching is the right direction,
+- but the current formulation may still be too weak or too local to fully fix generation behavior.
+
+## Current decision
+
+The working decision after reviewing losses and 5k / 10k inference is:
+- keep the revised Stage 2 running until **20k**,
+- do not move to Stage 3 yet,
+- and do not over-read the current loss improvements as proof that generation quality is fixed.
+
+Why 20k:
+- 5k was too early,
+- 10k still looked inconclusive,
+- 20k is a reasonable cap for this Stage 2 recipe before deciding whether it needs another redesign.
+
+What 20k should answer:
+- whether the qualitative gap between teacher-matching losses and actual inference quality begins to close,
+- whether easy prompts improve beyond the current abstract failure mode,
+- and whether Stage 2 v2 is genuinely progressing or simply optimizing a still-incomplete proxy objective.
+
 ## Short summary
 
 The 3-stage plan was introduced because direct diffusion training kept producing weak prompt grounding.

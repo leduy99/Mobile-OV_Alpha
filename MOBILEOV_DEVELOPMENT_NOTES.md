@@ -10,6 +10,7 @@ Tài liệu tổng hợp về quá trình phát triển MobileOV, các thay đ�
 5. [Performance Analysis](#performance-analysis)
 6. [Stage-3 SANA Tracking (2026-02-25)](#stage-3-sana-tracking-2026-02-25)
 7. [Current 3-Stage Status (2026-03-19)](#current-3-stage-status-2026-03-19)
+8. [Stage-1 Sem+Vis Restart (2026-03-21)](#stage-1-semvis-restart-2026-03-21)
 
 ---
 
@@ -32,7 +33,46 @@ Use the dedicated note above as the current reference for:
 - what Stage 1 and the first Stage 2 taught us,
 - why we changed Stage 2 instead of jumping to Stage 3,
 - what the new Stage 2 objective is trying to match,
-- and what signals should be monitored before enabling Stage 3.
+- what happened by the 5k and 10k checkpoints of Stage 2 v2,
+- why better loss did not yet translate into clearly better inference,
+- and why the current plan is to hold Stage 2 v2 until 20k before deciding on the next redesign.
+
+---
+
+## Stage-1 Sem+Vis Restart (2026-03-21)
+
+After checking the hybrid continuation line at both `5k` and `10k`, we decided
+to stop that run and restart from pretrained base instead of continuing to patch
+later stages.
+
+Reference note:
+- `docs/STAGE1_SEMVIS_RESTART_NOTE_20260321.md`
+
+Canonical files for the new restart:
+- `configs/stage1_teacher_free_joint_openvid_current_laion_coyo_semvis_frombase_5v1i_2gpu_20260321.yaml`
+- `scripts/train_openvid_current_laion_coyo_stage1_semvis_frombase_5v1i.sh`
+
+Prepared follow-up if the new 500M restart still fails:
+- `configs/stage1_teacher_free_joint_openvid_current_laion_coyo_semvis_frombase_smolvlm2_2p2b_5v1i_2gpu_20260321.yaml`
+- `scripts/train_openvid_current_laion_coyo_stage1_semvis_frombase_2p2b_5v1i.sh`
+
+Why this restart exists:
+- the hybrid continuation remained numerically stable but did not improve
+  qualitative inference in a meaningful way,
+- the `5k -> 10k` comparison stayed in the same failure family,
+- this suggested the earlier semantic-only Stage 1 had already biased the
+  student manifold in a way that later patching could not cleanly repair.
+
+The new recipe changes the starting assumption:
+- restart from pretrained base,
+- keep semantic teacher anchoring from step 0,
+- allow a small amount of DiT text-facing adaptation from step 0,
+- reduce proxy-loss dominance so diffusion quality matters more,
+- and only move to `SmolVLM2-2.2B` if this cleaner 500M restart still fails.
+
+Smoke status:
+- the new `500M` restart recipe passed a real `1-step` two-GPU smoke run
+  including forward, backward, and checkpoint save.
 
 ---
 

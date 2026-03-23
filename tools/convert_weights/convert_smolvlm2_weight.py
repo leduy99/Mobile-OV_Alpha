@@ -49,7 +49,7 @@ def convert_smolvlm2_weight(model_id: str, output_path: str, device: str = "cuda
         model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             trust_remote_code=True,
-            dtype=torch.float16,
+            torch_dtype=torch.float16,
         )
         logger.info("✅ Loaded as AutoModelForImageTextToText (has lm_head and generate method)")
         if hasattr(model, 'lm_head'):
@@ -62,7 +62,7 @@ def convert_smolvlm2_weight(model_id: str, output_path: str, device: str = "cuda
         model = AutoModel.from_pretrained(
             model_id,
             trust_remote_code=True,
-            dtype=torch.float16,
+            torch_dtype=torch.float16,
         )
         logger.warning("⚠️ Using AutoModel - model will NOT have text generation capability")
     
@@ -224,5 +224,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

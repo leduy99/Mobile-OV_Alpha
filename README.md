@@ -106,15 +106,14 @@ Canonical options:
 - `tools/data_prepare/download_openvid.py` for lightweight CSV / part download
 
 See:
-- `OPENVID_TRAINING_GUIDE.md`
-- `download_data/README.md`
+- `download_data/README.md` (step-by-step guide)
 
 ### MSR-VTT
 Use:
 - `tools/data_prepare/msrvtt_data_prepare.py`
 
 See:
-- `tools/data_prepare/MSRVTT_DATA_PREPARE.md`
+- `tools/data_prepare/MSRVTT_DATA_PREPARE.md` (step-by-step guide)
 
 ### LAION / COYO
 Current repo support is manifest-based rather than one-shot raw crawling.
@@ -122,6 +121,10 @@ Canonical tools are:
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
 - `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
+- `tools/data_prepare/build_laion_coyo_encoded_manifest.py`
+
+See:
+- `docs/LAION_COYO_DATA_PREPARE.md` (step-by-step guide)
 
 ## Main Entry Points
 
@@ -140,6 +143,7 @@ Canonical tools are:
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
 - `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
+- `docs/LAION_COYO_DATA_PREPARE.md`
 - `download_data/`
 
 ## What To Ignore
@@ -158,3 +162,7 @@ These paths are not the current recommended public surface:
 - Runtime outputs, checkpoints, and datasets remain git-ignored.
 
 If you are onboarding a teammate, start with `SETUP_AND_TRAINING.md`.
+
+For a single-file onboarding path from setup to data to training to inference,
+see:
+- `docs/END_TO_END_GUIDE.md`
