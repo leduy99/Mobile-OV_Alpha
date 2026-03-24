@@ -11,6 +11,8 @@ Tài liệu tổng hợp về quá trình phát triển MobileOV, các thay đ�
 6. [Stage-3 SANA Tracking (2026-02-25)](#stage-3-sana-tracking-2026-02-25)
 7. [Current 3-Stage Status (2026-03-19)](#current-3-stage-status-2026-03-19)
 8. [Stage-1 Sem+Vis Restart (2026-03-21)](#stage-1-semvis-restart-2026-03-21)
+9. [Smol Visual Recipe Repro (2026-03-25)](#smol-visual-recipe-repro-2026-03-25)
+10. [Experiment Report (2026-03-25)](#experiment-report-2026-03-25)
 
 ---
 
@@ -73,6 +75,84 @@ The new recipe changes the starting assumption:
 Smoke status:
 - the new `500M` restart recipe passed a real `1-step` two-GPU smoke run
   including forward, backward, and checkpoint save.
+
+---
+
+## Smol Visual Recipe Repro (2026-03-25)
+
+We now have a dedicated note for the `SmolVLM2-500M + bridge + full DiT`
+recipe that looks much healthier than the recent Qwen experiments and is worth
+preserving as a candidate "known-good family".
+
+Detailed note:
+- `docs/SMOL_VISUAL_RECIPE_NOTE_20260325.md`
+
+Why this note exists:
+- the old `2026-03-16 initfrom30k_nodistill` line could not be replayed
+  directly because its upstream init checkpoint was no longer on disk,
+- to recover that lineage faithfully, we relaunched the upstream
+  `2026-03-15 online_teacher_30k` family first,
+- this run restored the old training shape:
+  - `SmolVLM2-500M`
+  - bridge trainable
+  - full DiT trainable
+  - online teacher distill
+  - semantic anti-collapse enabled
+  - `1V:1I`
+  - `grad_accum_steps=1`
+- by `4k`, the line still was not "solved", but it looked materially more
+  stable than the Qwen lines in both loss geometry and qualitative behavior.
+
+Use the dedicated note above as the reference for:
+- the exact config/launcher/log paths for the reproduction run,
+- why this recipe is currently the strongest candidate to keep around,
+- which metrics looked healthy enough to justify waiting longer,
+- what the early `4k` inference did and did not prove,
+- and how to branch from this family later if we want to recover the old
+  `initfrom30k_nodistill` behavior again.
+
+---
+
+## Experiment Report (2026-03-25)
+
+We now also have a longer, presentation-friendly experiment report that
+summarizes the recent Smol and Qwen runs, quotes representative log lines, and
+records the main failure modes and next-step hypotheses.
+
+Detailed report:
+- `docs/EXPERIMENT_REPORT_20260325.md`
+
+Use this report when we need:
+- a shareable summary for other collaborators,
+- a single place that explains the architecture + dataset + loss setup,
+- a chronological view of what we tried and what failed,
+- or a structured explanation of why the current diagnosis is
+  \"semantic stability without reliable prompt grounding\".
+
+---
+
+## Colleague Handoff (2026-03-25)
+
+We now have a new single-note handoff written specifically for sending to a
+teammate without asking them to open multiple notes.
+
+Handoff note:
+- `docs/COLLEAGUE_HANDOFF_20260325.md`
+
+This version is intentionally self-contained. It includes:
+- the full architecture summary,
+- dataset and schedule choices,
+- all major experiment families from `2026-03-15` to `2026-03-25`,
+- representative quoted log lines from the real runs,
+- the ladder-test findings,
+- the current diagnosis,
+- and the concrete next-step recommendations.
+
+Use this note when we want:
+- one document to send directly to a collaborator,
+- one place to explain both the experiment history and the current state,
+- or one self-contained summary that does not rely on cross-referencing the
+  older notes.
 
 ---
 
