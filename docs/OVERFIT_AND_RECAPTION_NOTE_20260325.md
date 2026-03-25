@@ -834,3 +834,236 @@ So the current priority should be:
 - change the **functional training objective** before scaling further,
 - use overfit as the fast diagnostic loop,
 - and treat recaptioning as a secondary data-contract experiment, not the primary fix.
+
+---
+
+## 9. Follow-Up Image Overfit Positive Control (`clean10`)
+
+Later the same day we ran a complementary image-only overfit test because the video overfit result was mixed:
+
+- the stack clearly learned something,
+- but the learning was uneven,
+- and it was still possible to argue that video generation was simply too hard a setting for a clean diagnosis.
+
+So we switched to a much easier positive-control test:
+
+- image-only,
+- `10` carefully chosen `LAION/COYO` samples,
+- same `SmolVLM2-500M -> bridge -> full DiT -> SANA` structure,
+- same diffusion-only objective,
+- no teacher distill,
+- no semantic regularizer.
+
+The goal here was narrower:
+
+- can the current architecture actually learn clean prompt-image mappings at all when the problem is easy enough?
+
+### 9.1 Dataset and recipe
+
+Manifest:
+
+- `data/mix/manifests/laion_coyo_clean10_image_overfit_20260325.csv`
+
+Training config:
+
+- `configs/stage1_teacher_free_laion_coyo_clean10_image_overfit_nodistill_noreg_scratch_1gpu_20260325.yaml`
+
+Run directory:
+
+- `output/stage1_overfit_laion_coyo_clean10_image_smolvlm2_500m_nodistill_noreg_scratch_20260325_1gpu/20260325_223156`
+
+Key recipe:
+
+- `SmolVLM2-500M` frozen
+- bridge trainable
+- full DiT trainable
+- image-only (`latent_t = 1`)
+- init from scratch
+- `batch_size = 1`
+- `grad_accum_steps = 1`
+- `shuffle = false`
+- `drop_last = false`
+- `total_steps = 6000`
+- `save_every_steps = 500`
+
+Exact loss stack:
+
+- `loss.diff.weight = 1.0`
+- `loss.distill.enabled = false`
+- `loss.semantic_probe.enabled = false`
+- `loss.norm.enabled = false`
+- `loss.gate.enabled = false`
+- `run.cfg_dropout_prob = 0.0`
+
+So this run is directly comparable in spirit to the clean16 scratch video overfit run, except that:
+
+- the modality is image-only,
+- the training set is smaller (`10` samples),
+- and the task is much easier than video generation.
+
+### 9.2 The ten selected prompts
+
+The clean10 image subset intentionally avoided obvious product-listing garbage, slogans, or text-heavy meme captions.
+
+Representative prompts in the subset:
+
+1. `a man and a woman stand by the car he kisses her on the neck`
+2. `Woman cooking rice with vegetables in kitchen`
+3. `A fresh baked Earl Grey Honey Lemon Mascarpone Cheesecake`
+4. `An aerial image of Vancouver, showing Stanley Park, downtown, Granville Bridge, Burrard Street Bridge and the waterfront.`
+
+The remaining six prompts were selected with the same spirit:
+
+- concrete subjects,
+- visible actions or scenes,
+- short enough to be tractable,
+- image-grounded rather than slogan-like.
+
+### 9.3 Training behavior
+
+Representative log points:
+
+- `Step 100`
+  - `loss=0.086914 diff=0.086914 ... cond_uncond_dloss=0.240234 ... cond_pred_ratio=0.064863`
+- `Step 500`
+  - `loss=0.099121 diff=0.099121 ... cond_uncond_dloss=0.152344 ... cond_pred_ratio=0.096768`
+- `Step 500 probe_semantic`
+  - `mcp_offdiag(mean/min/max)=0.446789/... smol_offdiag=0.451428`
+- `Step 3000`
+  - `loss=0.105469 diff=0.105469 ... cond_uncond_dloss=0.271484 ... cond_pred_ratio=0.096546`
+- `Step 3000 probe_semantic`
+  - `mcp_offdiag(mean/min/max)=0.444347/... smol_offdiag=0.451428`
+- `Step 6000`
+  - `loss=0.056885 diff=0.056885 ... cond_uncond_dloss=0.203125 ... cond_pred_ratio=0.079331`
+- `Step 6000 probe_semantic`
+  - `mcp_offdiag(mean/min/max)=0.440565/0.362253/0.570518 smol_offdiag=0.451428`
+
+There are two important observations here.
+
+First:
+
+- bridge separation does **not** need to become dramatically better for the run to improve visually.
+- `mcp_offdiag` only moved from about `0.4468` to `0.4406`.
+
+Second:
+
+- `cond_pred_ratio` stayed materially higher than in the failing full image-only run.
+- it hovered roughly in the `0.08 - 0.10` band instead of decaying toward `~0.02`.
+
+That is already a strong signal that this small clean subset is a very different optimization regime from the noisy full image manifest.
+
+### 9.4 Inference progression
+
+We inferred three checkpoints with the same fair-comparison protocol:
+
+- backend `fixed`
+- `12` denoise steps
+- `cfg_scale = 1.0`
+- `num_frames = 1`
+- seed `0`
+
+Outputs:
+
+- `step500`
+  - `output/inference_laion_coyo_clean10_image_overfit_step500_fixed12_cfg1_f1_20260325`
+- `step3000`
+  - `output/inference_laion_coyo_clean10_image_overfit_step3000_fixed12_cfg1_f1_20260325`
+- `final`
+  - `output/inference_laion_coyo_clean10_image_overfit_final_fixed12_cfg1_f1_20260325`
+
+Qualitative summary:
+
+- `step500`
+  - still looked semantically weak and partially collapsed
+  - very similar to the earlier failure mode seen in the full image-only run
+- `step3000`
+  - improved clearly
+  - prompt differences became much easier to see
+- `step6000 / final`
+  - looked noticeably better again
+  - overall prompt-image alignment became much more believable
+
+This progression matters a lot. It shows that the architecture can move from:
+
+- early generic / weakly conditioned outputs
+
+to:
+
+- distinctly better prompt-conditioned outputs
+
+under a clean small-scale image-only training setup.
+
+### 9.5 Why this result changes the interpretation
+
+This clean10 run is not a production recipe. It is a diagnostic control.
+
+What it tells us:
+
+1. The current architecture is **capable of learning**.
+   - The model is not fundamentally broken.
+   - Bridge + full DiT can learn useful prompt conditioning under the right conditions.
+
+2. Diffusion-only is **not inherently hopeless**.
+   - The same diffusion-only family that looked terrible on the full noisy image manifest becomes workable on a tiny clean subset.
+
+3. The earlier full image-only failure should not be read as “the model cannot learn image generation”.
+   - It is more accurate to read it as:
+   - the current stack does not cope well with the scale and noise of the full image manifest on the timescale we trained.
+
+### 9.6 What this does and does not prove
+
+What it proves:
+
+- the stack can learn on clean image-only data,
+- prompt conditioning is not dead by design,
+- there is no need to abandon the current architecture purely because of the failing full image-only run.
+
+What it does **not** prove:
+
+- that full-data training only needs more wall-clock time,
+- that the noisy full image manifest is good enough as-is,
+- or that any large-scale image run will eventually become clean10-like if left running indefinitely.
+
+The reason we should be careful is that the full image-only run showed a very different signature:
+
+- raw step count looked large,
+- but epoch count was still low because the dataset had `43,387` samples,
+- and, more importantly, `cond_pred_ratio` decayed strongly over training.
+
+That is not the same pattern as a healthy run that is simply learning slowly.
+
+### 9.7 Operational decision taken after this result
+
+The clean10 positive control changed the next-step plan.
+
+Before this run, it was still plausible that:
+
+- the architecture itself might be too weak,
+- or that diffusion-only was fundamentally the wrong family for image alignment.
+
+After this run, the more productive interpretation became:
+
+- architecture is probably acceptable,
+- small clean subsets can work,
+- so the next experiment should scale the clean subset upward in a controlled way.
+
+This is why the next planned image experiment is:
+
+- build a cleaner `1000`-image subset from the same larger image pool,
+- train it for many epochs with no practical step cap,
+- save checkpoints every `5000` steps,
+- and use the best resulting checkpoint later as the image-side initialization for image+video joint training.
+
+### 9.8 Revised bottom line after adding clean10
+
+The updated view after adding the clean10 image positive control is:
+
+- the current stack still has a real prompt-conditioning problem at scale,
+- but it is **not** an “architecture cannot learn” problem,
+- and it is **not** enough to say only “diffusion-only is bad”.
+
+The more precise statement is:
+
+- the architecture can learn on clean small-scale image data,
+- the stack fails much more easily when data becomes noisier and larger,
+- and the next most useful question is how far we can scale a clean subset before the same prompt-collapse pattern returns.
