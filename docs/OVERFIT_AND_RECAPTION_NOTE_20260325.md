@@ -274,6 +274,37 @@ Key settings:
 
 This run was intentionally constrained to avoid wasting compute on a muddy setup.
 
+### 4.2.1 Exact loss stack used in the scratch run
+
+The scratch overfit run used the simplest loss stack we had tried that day.
+
+Direct config settings:
+
+- `loss.diff.weight = 1.0`
+- `loss.distill.enabled = false`
+- `loss.semantic_probe.enabled = false`
+- `loss.norm.enabled = false`
+- `loss.gate.enabled = false`
+- `run.cfg_dropout_prob = 0.0`
+- `train.flow_shift = 3.0`
+
+So in practice:
+
+- the total optimization target was just the diffusion loss,
+- there was no token-level teacher supervision,
+- there was no pooled-teacher supervision,
+- there was no semantic anti-collapse regularizer,
+- there was no auxiliary norm or gate penalty.
+
+The diffusion loss itself inherits the SANA-video flow-matching formulation:
+
+- noisy latent is sampled along a linear flow path between clean latent and Gaussian noise,
+- the model predicts `flow_v`,
+- the target is `noise - x_start`,
+- and the loss is MSE on that target.
+
+This matters because it means the run was **not** regularized toward prompt discrimination in any direct way. The objective only rewarded denoising correctness.
+
 ### 4.3 Training behavior
 
 Representative log lines:
@@ -403,6 +434,119 @@ But the final outcome still fails the test we wanted:
 - if the system truly overfit cleanly, we would expect nearly all train prompts to win on the diagonal,
 - especially in such a tiny dataset.
 
+### 4.6.1 Case study: why `selfie` and `cookies` worked better than `man` and `lily`
+
+Looking only at aggregate metrics hides an important nuance. The final run did not fail uniformly.
+
+There were two relatively successful cases:
+
+- `selfie_livingroom`
+- `cookies_baking`
+
+And two persistent failure cases:
+
+- `man_street`
+- `lily_bloom`
+
+This asymmetry turned out to be informative.
+
+#### Raw Smol prompt similarity already predicts the confusion pattern
+
+From the raw Smol prompt-similarity analysis on the same four prompts:
+
+- `selfie_livingroom` vs `man_street` = `0.8853`
+- `lily_bloom` vs `cookies_baking` = `0.8256`
+- `selfie_livingroom` vs `lily_bloom` = `0.7305`
+- `selfie_livingroom` vs `cookies_baking` = `0.7753`
+- `man_street` vs `lily_bloom` = `0.5936`
+- `man_street` vs `cookies_baking` = `0.6414`
+
+The two pairs that are most strongly confused by the generator are also the two pairs that start out closest in the raw Smol text space:
+
+- `man_street` gets pulled toward `selfie_livingroom`
+- `lily_bloom` gets pulled toward `cookies_baking`
+
+So the model is not confusing prompts randomly. It is confusing prompts along directions that were already close upstream.
+
+#### Ground-truth quality is also uneven across the four cases
+
+Using WAN decode on the stored ground-truth latents, we measured CLIP text-image agreement for the actual training targets:
+
+- `selfie_livingroom`: `0.3396 / 0.3534 / 0.3364` on `first / mid / last`
+- `man_street`: `0.2356 / 0.2298 / 0.2407`
+- `lily_bloom`: `0.3453 / 0.3646 / 0.3532`
+- `cookies_baking`: `0.3664 / 0.3558 / 0.3410`
+
+This is important:
+
+- `man_street` is the weakest target even in the ground-truth decode proxy,
+- `selfie`, `lily`, and `cookies` are all materially clearer.
+
+So `man_street` is doubly disadvantaged:
+
+- it is already very close to `selfie` in text space,
+- and its target video appears less semantically sharp in the latent decode proxy.
+
+#### Final overfit errors are structured, not arbitrary
+
+At the final checkpoint:
+
+- `selfie_livingroom`
+  - diagonal `0.2927`
+  - best prompt `selfie_livingroom`
+  - margin vs best wrong prompt: `+0.1117`
+- `cookies_baking`
+  - diagonal `0.3359`
+  - best prompt `cookies_baking`
+  - margin vs best wrong prompt: `+0.0633`
+- `man_street`
+  - diagonal `0.2076`
+  - best prompt `selfie_livingroom = 0.2523`
+  - margin vs best wrong prompt: `-0.0448`
+- `lily_bloom`
+  - diagonal `0.2132`
+  - best prompt `cookies_baking = 0.2321`
+  - margin vs best wrong prompt: `-0.0189`
+
+These margins tell a coherent story:
+
+- `selfie` is clearly learned,
+- `cookies` is learned but less cleanly,
+- `lily` is close to working but still loses to its neighboring prompt family,
+- `man` remains too generic and is still absorbed by the indoor-person prototype.
+
+#### Final outputs remain clustered, but not equally so
+
+Mean image-image off-diagonal similarity at final:
+
+- `selfie_livingroom`: `0.6369`
+- `man_street`: `0.7572`
+- `lily_bloom`: `0.6962`
+- `cookies_baking`: `0.6761`
+
+This again lines up with qualitative inspection:
+
+- `selfie` is the most visually distinct output,
+- `man_street` is the least distinct and looks the most generic,
+- `cookies` and `lily` sit in between.
+
+#### Positive control interpretation
+
+This section is important because it changes how we should talk about the overfit result.
+
+The run is **not** a uniform failure. It is better described as:
+
+- capable of learning some coarse prototypes or families,
+- capable of genuinely improving at least one prompt substantially (`selfie_livingroom`),
+- but still not discriminative enough to separate nearby prompts reliably.
+
+Human visual inspection agreed with this reading:
+
+- the final `selfie_livingroom` sample looked materially better than the `step1000` and `step2000` samples,
+- and it looked plausibly closer to the ground-truth video semantics than the early checkpoints.
+
+So the scratch run does show real learning. The problem is that the learning remains selective and entangled.
+
 ### 4.7 Interpretation
 
 This is the most important finding of the overfit track.
@@ -423,6 +567,11 @@ That points more strongly to:
    - bridge + DiT may still allow a solution that uses prompt only weakly,
 3. raw text-space clustering as an upstream amplifier
    - since Smol prompt embeddings are already highly clustered.
+
+It also suggests a more precise qualitative diagnosis:
+
+- the system can learn **family-level** semantics,
+- but it still struggles with **instance-level discrimination** when two prompts live close together in the upstream text space or when one target is less semantically sharp than another.
 
 What it points away from:
 
