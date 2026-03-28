@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from nets.omni.modules.sana_prompt_bridge import SanaPromptBridge
+from nets.omni.modules.sana_prompt_bridge_qwen3vl import Qwen3VLSanaPromptBridge
 from tools.train_stage1_teacher_free import apply_lora_to_module, preprocess_prompts, to_attrdict
 from diffusion.model.utils import prepare_prompt_ar
 from diffusion.data.datasets import utils as sana_dataset_utils
@@ -58,6 +59,13 @@ def main():
     parser.add_argument("--csv-path", type=str, default="data/openvid_q1/OpenVid_prompt_subset.csv")
     parser.add_argument("--prompt-index", type=int, default=0, help="Prompt index in CSV")
     parser.add_argument("--prompt", type=str, default=None, help="Direct prompt text (overrides CSV)")
+    parser.add_argument(
+        "--backbone-type",
+        type=str,
+        default=os.environ.get("STUDENT_BACKBONE_TYPE", "smolvlm2"),
+        choices=["smolvlm2", "qwen3_vl", "qwen3vl", "qwen"],
+        help="Student text backbone type used by the bridge.",
+    )
     parser.add_argument(
         "--smolvlm2-ckpt-path",
         type=str,
@@ -105,7 +113,7 @@ def main():
         "--projector-type",
         type=str,
         default="auto",
-        choices=["auto", "legacy", "mcp_tiny", "mcp_full"],
+        choices=["auto", "legacy", "mcp_tiny", "mcp_full", "mcp_lexical_gated", "mcp_lexical_bottleneck"],
         help="Bridge projector type. 'auto' infers MCP usage from checkpoint.",
     )
     parser.add_argument("--mcp-hidden-dim", type=int, default=None)
@@ -169,8 +177,11 @@ def main():
         print(f"SANA checkpoint dir missing, auto-downloading to: {args.checkpoint_dir}")
         runtime_backend.download_checkpoint(local_dir=args.checkpoint_dir)
 
-    if args.prompt is not None and str(args.prompt).strip():
-        prompt = str(args.prompt).strip()
+    prompt_arg = None if args.prompt is None else str(args.prompt)
+    if prompt_arg == "__EMPTY__":
+        prompt = ""
+    elif prompt_arg is not None and prompt_arg.strip():
+        prompt = prompt_arg.strip()
     else:
         df = pd.read_csv(args.csv_path)
         prompts = df["caption"].dropna().astype(str).tolist()
@@ -226,11 +237,18 @@ def main():
     hint_use_chi_prompt = bool(infer_hints.get("train_use_chi_prompt", False))
     hint_use_prompt_templates = bool(infer_hints.get("train_use_prompt_templates", False))
     hint_strict_sana_parity = bool(infer_hints.get("strict_sana_parity_text_path", False))
+    hint_strict_sana_use_full_text_window = bool(infer_hints.get("strict_sana_use_full_text_window", False))
+    hint_strict_sana_token_select_strategy = str(
+        infer_hints.get("strict_sana_token_select_strategy", "tail") or "tail"
+    )
+    hint_strict_sana_head_tokens = int(infer_hints.get("strict_sana_head_tokens", 96) or 96)
+    hint_strict_sana_tail_tokens = int(infer_hints.get("strict_sana_tail_tokens", 96) or 96)
     hint_strict_fail_fast_mask = bool(infer_hints.get("strict_fail_fast_mask", hint_strict_sana_parity))
     hint_sana_model_max_length = int(
         infer_hints.get("sana_model_max_length", getattr(config.text_encoder, "model_max_length", 300)) or 300
     )
     hint_student_max_length = int(infer_hints.get("train_student_max_length", 512) or 512)
+    hint_student_pre_dit_layernorm = bool(infer_hints.get("mcp_pre_dit_layernorm", True))
 
     use_chi_prompt = bool(args.use_chi_prompt or hint_use_chi_prompt)
     if args.disable_motion_score:
@@ -328,7 +346,9 @@ def main():
         mcp_use_refine = bool(infer_hints["mcp_use_refine"])
     if infer_hints.get("mcp_refine_kernel_size", None) is not None and args.mcp_refine_kernel_size == 3:
         mcp_refine_kernel_size = int(infer_hints["mcp_refine_kernel_size"])
-    if projector_type in ("mcp_tiny", "mcp_full") and isinstance(projector_state, dict) and projector_state:
+    mcp_lexical_bottleneck_dim = int(infer_hints.get("mcp_lexical_bottleneck_dim", 256) or 256)
+    mcp_lexical_gate_init = float(infer_hints.get("mcp_lexical_gate_init", 0.05) or 0.05)
+    if projector_type in ("mcp_tiny", "mcp_full", "mcp_lexical_gated", "mcp_lexical_bottleneck") and isinstance(projector_state, dict) and projector_state:
         if mcp_hidden_dim is None and "compress.weight" in projector_state:
             mcp_hidden_dim = int(projector_state["compress.weight"].shape[0])
         if mcp_num_fuse_layers is None and "layer_w" in projector_state:
@@ -340,11 +360,12 @@ def main():
     if mcp_hidden_dim is None:
         mcp_hidden_dim = 512
     if mcp_num_fuse_layers is None:
-        mcp_num_fuse_layers = 4
+        mcp_num_fuse_layers = 2
 
     # Student embeddings via bridge
-    bridge = SanaPromptBridge(
-        smolvlm2_ckpt_path=args.smolvlm2_ckpt_path,
+    backbone_type = str(args.backbone_type or "smolvlm2").lower()
+    bridge_cls = Qwen3VLSanaPromptBridge if backbone_type in {"qwen3_vl", "qwen3vl", "qwen"} else SanaPromptBridge
+    bridge_kwargs = dict(
         adapter_ckpt_dir=args.adapter_ckpt_dir,
         adapter_in_channels=args.adapter_in_channels,
         adapter_out_channels=args.adapter_out_channels,
@@ -352,7 +373,6 @@ def main():
         adapter_num_encoder_layers=args.adapter_enc_layers,
         adapter_num_decoder_layers=args.adapter_dec_layers,
         adapter_ff_mult=args.adapter_ff_mult,
-        smol_vh_num_queries=1,
         num_prompt_queries=config.text_encoder.model_max_length,
         caption_channels=getattr(config.text_encoder, "caption_channels", 2304),
         precision_dtype=dtype,
@@ -368,16 +388,34 @@ def main():
         mcp_use_refine=mcp_use_refine,
         mcp_refine_kernel_size=mcp_refine_kernel_size,
         mcp_fusion_temperature=args.mcp_fusion_temperature,
+        mcp_lexical_bottleneck_dim=mcp_lexical_bottleneck_dim,
+        mcp_lexical_gate_init=mcp_lexical_gate_init,
         strict_sana_parity_text_path=hint_strict_sana_parity,
+        strict_sana_use_full_text_window=hint_strict_sana_use_full_text_window,
+        strict_sana_token_select_strategy=hint_strict_sana_token_select_strategy,
+        strict_sana_head_tokens=hint_strict_sana_head_tokens,
+        strict_sana_tail_tokens=hint_strict_sana_tail_tokens,
         fail_fast_mask=hint_strict_fail_fast_mask,
         sana_model_max_length=hint_sana_model_max_length,
         sana_chi_prompt=chi_prompt_text,
         tokenizer_model_id=args.tokenizer_model_id,
-        lora_enable=lora_enable,
-        lora_r=lora_r,
-        lora_alpha=lora_alpha,
-        lora_dropout=args.lora_dropout,
     )
+    if bridge_cls is SanaPromptBridge:
+        bridge_kwargs.update(
+            smolvlm2_ckpt_path=args.smolvlm2_ckpt_path,
+            smol_vh_num_queries=1,
+            lora_enable=lora_enable,
+            lora_r=lora_r,
+            lora_alpha=lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
+    else:
+        bridge_kwargs.update(
+            qwen_ckpt_path=args.smolvlm2_ckpt_path,
+            gate_min_value=0.0,
+            lora_enable=False,
+        )
+    bridge = bridge_cls(**bridge_kwargs)
     bridge_tokenizer = bridge._get_tokenizer()
     bridge_tokenizer_cls = type(bridge_tokenizer).__name__
     bridge_tokenizer_mod = type(bridge_tokenizer).__module__
@@ -484,8 +522,10 @@ def main():
             neg_prompt = args.negative_prompt
             negative_embeddings, neg_mask = bridge([neg_prompt], return_mask=True)
         # Match training path:
-        # train_stage1_teacher_free.py applies LayerNorm on bridge outputs before DiT.
-        if not args.no_bridge_post_layernorm:
+        # train_stage1_teacher_free.py may apply an extra LayerNorm on bridge outputs
+        # before the DiT. Respect the train-time infer_hints by default.
+        apply_bridge_post_layernorm = hint_student_pre_dit_layernorm and (not args.no_bridge_post_layernorm)
+        if apply_bridge_post_layernorm:
             text_embeddings = F.layer_norm(text_embeddings, (text_embeddings.shape[-1],))
             if negative_embeddings is not None:
                 negative_embeddings = F.layer_norm(negative_embeddings, (negative_embeddings.shape[-1],))

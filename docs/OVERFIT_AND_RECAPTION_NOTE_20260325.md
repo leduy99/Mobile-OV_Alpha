@@ -1067,3 +1067,486 @@ The more precise statement is:
 - the architecture can learn on clean small-scale image data,
 - the stack fails much more easily when data becomes noisier and larger,
 - and the next most useful question is how far we can scale a clean subset before the same prompt-collapse pattern returns.
+
+---
+
+## 10. Architecture Update On 2026-03-27: Add A Lexical Branch From `hidden_0`
+
+After the large-scale `clean10k` image runs continued to produce weak prompt binding, we paused and measured where SmolVLM2 was losing diversity across layers on the exact prompt probes we had been using.
+
+This produced a new architectural decision:
+
+- keep the existing `hidden_last / last-K` semantic stream,
+- add a lexical stream from `hidden_0`,
+- merge that lexical signal **inside the bridge**,
+- and prefer the simple `gated add, no bottleneck` design over a compressed lexical branch.
+
+### 10.1 Motivation: early-layer similarity measurement
+
+Artifact:
+
+- `output/analysis/smol_early_layer_similarity_clean10k_probe_20260327/summary.json`
+
+We measured prompt similarity on the four `clean10k` probe prompts using:
+
+- raw token embedding pool,
+- `hidden_0`,
+- several intermediate hidden layers,
+- `hidden_last`.
+
+Main results:
+
+- `token_embedding_raw offdiag mean = 0.275702`
+- `hidden_0 offdiag mean = 0.275702`
+- `hidden_1 offdiag mean = 0.929846`
+- `hidden_2 offdiag mean = 0.940681`
+- `hidden_4 offdiag mean = 0.997026`
+- `hidden_8 offdiag mean = 0.994812`
+- `hidden_last offdiag mean = 0.660336`
+
+Interpretation:
+
+- SmolVLM2 still has strong lexical diversity at `token_embedding_raw` / `hidden_0`.
+- That diversity is lost extremely early. By `hidden_1` and `hidden_2`, prompts are already highly clustered.
+- Mid layers are almost fully collapsed on this probe set.
+- `hidden_last` is more useful semantically than the mid layers, but it is still much less diverse than `hidden_0`.
+
+This was the turning point.
+
+The bridge had been consuming only the late semantic stream. That meant it was being fed a representation that was already much more clustered than the raw lexical signal available one layer earlier.
+
+### 10.2 Design constraint: do not throw away `hidden_last`
+
+We did **not** want to replace `hidden_last` entirely.
+
+Reason:
+
+- future work still needs a semantic stream that is likely useful for editing and general instruction-following,
+- so the right design is not “use only `hidden_0`,”
+- the right design is “preserve the semantic trunk, but inject lexical diversity back into the bridge.”
+
+### 10.3 Two bridge ablations that were implemented
+
+We implemented two bridge variants on top of the current MCP path.
+
+Common idea:
+
+- semantic stream = current `last-K` fused MCP input,
+- lexical stream = `hidden_0`,
+- final bridge output contract unchanged:
+  - still `300 x 2304`,
+  - still fed into the same DiT path.
+
+The two variants were:
+
+1. `mcp_lexical_gated`
+   - lexical stream taken from `hidden_0`
+   - normalized and added back into the semantic stream with a small learnable gate
+   - **no bottleneck**
+
+2. `mcp_lexical_bottleneck`
+   - lexical stream taken from `hidden_0`
+   - projected through a bottleneck MLP `960 -> 256 -> 960`
+   - then added back with a learnable gate
+
+The bottleneck version was included because it is more edge-friendly and more regularized, but it was only an ablation, not the default assumption.
+
+### 10.4 Clean10 ablation protocol
+
+To compare bridge designs cleanly, we trained both variants on the same `clean10` image-only overfit subset.
+
+Configs:
+
+- `configs/stage1_teacher_free_laion_coyo_clean10_image_overfit_lexical_gated_1gpu_20260327.yaml`
+- `configs/stage1_teacher_free_laion_coyo_clean10_image_overfit_lexical_bottleneck_1gpu_20260327.yaml`
+
+Run logs:
+
+- `output/logs/train_laion_coyo_clean10_image_overfit_lexical_gated_gpu1_20260327.log`
+- `output/logs/train_laion_coyo_clean10_image_overfit_lexical_bottleneck_gpu2_20260327.log`
+
+Recipe:
+
+- same `clean10` subset as the earlier positive-control image overfit,
+- `SmolVLM2-500M` frozen,
+- bridge trainable,
+- full DiT trainable,
+- diffusion-only,
+- `save_every_steps = 1000`,
+- `total_steps = 6000`,
+- same four probe prompts,
+- same inference setup used for fair comparison:
+  - fixed backend,
+  - `12` denoise steps,
+  - `cfg_scale = 1.0`,
+  - `num_frames = 1`.
+
+When this note was updated, both runs had already completed normally:
+
+- both reached `step6000`,
+- both saved `checkpoint_step6000.pt`,
+- both saved `checkpoint_final.pt`,
+- no active train process remained.
+
+### 10.5 Step4000 inference comparison
+
+Artifacts:
+
+- gated images:
+  - `output/inference_laion_coyo_clean10_image_overfit_lexical_gated_step4000_fixed12_cfg1_f1_20260327`
+- bottleneck images:
+  - `output/inference_laion_coyo_clean10_image_overfit_lexical_bottleneck_step4000_fixed12_cfg1_f1_20260327`
+
+Train-side snapshot at `step4000`:
+
+- gated:
+  - `cond_pred_ratio = 0.078495`
+  - `mcp_offdiag = 0.442785`
+- bottleneck:
+  - `cond_pred_ratio = 0.042352`
+  - `mcp_offdiag = 0.426468`
+
+Interpretation:
+
+- the bottleneck variant did produce slightly lower `mcp_offdiag`,
+- but the gated-no-bottleneck variant had much stronger **functional prompt influence** already at `step4000`,
+- and subjective image quality looked clearly better for the gated variant.
+
+The qualitative judgment from direct image inspection was:
+
+- both lexical variants looked better than the earlier non-lexical large-scale image runs,
+- but `mcp_lexical_gated` looked noticeably stronger than `mcp_lexical_bottleneck`,
+- especially in preserving prompt-specific visual details.
+
+### 10.6 Final step6000 comparison
+
+Final train-side numbers:
+
+- gated:
+  - `Step 6000 diff = 0.057373`
+  - `cond_pred_ratio = 0.093590`
+  - `mcp_offdiag = 0.445160`
+- bottleneck:
+  - `Step 6000 diff = 0.225586`
+  - `cond_pred_ratio = 0.043350`
+  - `mcp_offdiag = 0.436139`
+
+The pattern stayed the same:
+
+- bottleneck remained slightly more compressed in prompt space,
+- but it also remained much weaker on the actual prompt-effect probe,
+- and its images still looked worse.
+
+This is an important result because it separates two ideas that could easily be confused:
+
+- lower prompt-space similarity inside the bridge is **not** sufficient by itself,
+- what matters more for generation is whether the lexical branch improves **functional prompt influence** at the DiT output.
+
+In this ablation, the gated no-bottleneck branch won on the criterion that matters most.
+
+### 10.7 Architecture decision taken from this ablation
+
+We are dropping the bottleneck branch and keeping the simpler lexical-gated design.
+
+Decision:
+
+- selected architecture: `mcp_lexical_gated`
+- rejected architecture: `mcp_lexical_bottleneck`
+
+Reasoning:
+
+- the similarity study showed that the most useful missing signal lives at `hidden_0`,
+- the clean10 ablation showed that adding that signal back helps,
+- the no-bottleneck version preserves more of that lexical signal,
+- and in practice it gave better prompt binding than the bottlenecked variant.
+
+So the updated bridge design principle is:
+
+- preserve the late semantic trunk,
+- inject `hidden_0` as a lexical residual inside the bridge,
+- do **not** bottleneck that lexical stream unless later edge deployment constraints force a re-tradeoff.
+
+### 10.8 Updated takeaway after the lexical ablation
+
+This update matters because it changes the diagnosis again in a productive way.
+
+Before the lexical ablation, it was still plausible that:
+
+- the current bridge family might just be too weak,
+- or that the text-conditioning path was fundamentally not recoverable.
+
+After the similarity measurement plus clean10 lexical ablation, the better interpretation is:
+
+- SmolVLM2 still contains useful prompt-diverse signal,
+- but that signal is lost very early in the text stack,
+- feeding a lexical branch from `hidden_0` into the bridge is a valid way to recover it,
+- and the simplest gated-add version currently looks like the best design choice.
+
+This does **not** solve the full large-scale image problem by itself.
+
+But it is a meaningful architecture improvement, and it gives a much better-conditioned starting point for the next controlled training runs.
+
+## 11. Bridge-only online distill on clean10k: why the target space had to change
+
+After the lexical bridge update, the next hypothesis was that clean10k might still be failing because the **teacher distillation target itself was misaligned** with the native SANA conditioning path.
+
+The important architectural observation was:
+
+- native `Sana-video` does **not** condition directly on raw Gemma decoder hidden states,
+- the teacher text path first produces Gemma decoder hidden states,
+- then those hidden states are passed through `y_proj`,
+- then through `attention_y_norm` when `y_norm=true`,
+- and only that tensor is actually consumed by the DiT cross-attention blocks.
+
+So distilling bridge outputs against raw teacher hidden states, even with an extra ad-hoc layer norm on both sides, was not the clean target.
+
+The bridge was being asked to imitate a representation that the native SANA model does not itself condition on directly.
+
+That design mismatch matters because:
+
+- it can reward tokenwise alignment in the wrong space,
+- it can overwrite useful lexical diversity coming from `hidden_0`,
+- and it can still allow a collapsed solution as long as the raw-space loss goes down.
+
+### 11.1 Distill target change that was made
+
+The bridge-only online teacher run was therefore changed to distill inside the native SANA conditioning path:
+
+- teacher target space: `Gemma decoder hidden -> y_proj -> attention_y_norm`
+- student target space: `bridge output -> same frozen y_proj -> same frozen attention_y_norm`
+- conditioner weights are frozen for the distill computation,
+- so gradients still go into the bridge, but the target space itself does not drift just to satisfy distill.
+
+This became the new baseline teacher target:
+
+- `distill.target_space = sana_post_ynorm`
+- `distill.freeze_sana_conditioner = true`
+
+This change was motivated by **native-path fidelity**, not by a guess about which space might be more diverse.
+The goal was simply to make the student imitate the exact conditioning tensor that SANA uses.
+
+## 12. Why a second v2 update was still needed after post-ynorm distill
+
+The post-ynorm target fixed the largest conceptual error, but the run still plateaued too early.
+
+The key symptoms from the first bridge-only online-teacher run were:
+
+- it was clearly healthier than the older bridge-only distill formulation,
+- but prompt-space similarity still stayed too high,
+- and image quality still lagged behind what the training metrics initially suggested.
+
+The later diagnosis was that the remaining issue was no longer “wrong target space”, but a combination of:
+
+- lexical signal being injected too weakly,
+- too much normalization around the bridge output,
+- no explicit in-batch anti-collapse term,
+- no explicit geometry-preservation term tied to `hidden_0`,
+- and a hard text truncation policy that could still throw away useful lexical cues before the bridge ever saw them.
+
+### 12.1 Concrete reasons for each new change
+
+#### A. Stronger lexical residual gate
+
+Measured directly from the previous run checkpoint, the lexical gate was still effectively tiny, around the initial `~0.05` scale.
+That meant the most prompt-diverse signal in the system, `hidden_0`, was only entering the bridge as a very small residual.
+
+So the gate init was increased:
+
+- old: `mcp_lexical_gate_init = 0.05`
+- new: `mcp_lexical_gate_init = 0.2`
+
+This is a small architectural nudge, but it is important because it directly increases the usable amplitude of the lexical branch.
+
+#### B. Remove the extra pre-DiT layer norm
+
+The old path effectively normalized conditioning multiple times:
+
+- bridge output norm,
+- additional trainer-side layer norm,
+- and then native SANA `attention_y_norm` during target projection.
+
+That much normalization risks flattening the geometry we actually want to preserve.
+
+So the extra trainer-side norm before DiT was made optional and disabled in `v2`:
+
+- `model.student.projector.pre_dit_layernorm = false`
+
+The intent is to preserve a little more structure before the final native SANA conditioning norm.
+
+#### C. Add in-batch contrastive distill
+
+Token MSE and cosine losses only say:
+
+- “make student prompt `i` close to teacher prompt `i`.”
+
+They do **not** strongly say:
+
+- “make student prompt `i` different from teacher prompt `j != i`.”
+
+That is a classic gap when collapse is a concern.
+
+So an in-batch contrastive loss was added on pooled `post_ynorm` features:
+
+- positive: student `i` vs teacher `i`
+- negatives: student `i` vs teacher `j != i`
+
+This directly discourages the trivial “all prompts end up nearby” solution.
+
+#### D. Add hidden0 geometry preservation
+
+The whole lexical-bridge idea came from the earlier similarity study:
+
+- `hidden_0` stayed very diverse,
+- middle Smol layers collapsed strongly,
+- `hidden_last` recovered only partial diversity.
+
+So if the bridge is supposed to recover lost lexical distinctions, it is not enough to merely align to the teacher pointwise.
+
+We also want the bridge output to preserve some of the **relative prompt geometry** already present in `hidden_0`.
+
+That motivated the new geometry loss:
+
+- pool student conditioning in the distill space,
+- pool `hidden_0`,
+- match their in-batch similarity structure.
+
+This is meant to protect prompt separation rather than only semantic alignment.
+
+#### E. Add functional distill through the frozen DiT
+
+Pointwise conditioning similarity is still only a proxy.
+What we actually care about is whether the student conditioning produces the **same denoiser behavior** as the teacher conditioning.
+
+So a small functional loss was enabled:
+
+- run the frozen DiT with teacher conditioning,
+- compare prediction against the same frozen DiT with student conditioning,
+- add light MSE / cosine penalties on those predictions.
+
+This is valuable because it supervises the bridge in the same functional space that matters for generation.
+
+#### F. Replace hard tail-only truncation with an edge-friendly full-window selector
+
+This was the most subtle update.
+
+The original strict SANA-parity path kept only:
+
+- BOS token,
+- plus the final tail tokens needed to fit the `300` token budget.
+
+That is simple, but it assumes the most useful lexical information is always concentrated at the end of the sequence.
+For long captions, that is often wrong.
+
+Important object words or rare attributes can appear near the start or middle, while the tail may contain generic stylistic or descriptive residue.
+
+A full learned resampler could address this, but that would add parameters and make the bridge heavier.
+The edge-friendly alternative that was implemented instead is:
+
+- enable a full text window first,
+- then select back down to `300` tokens using a lightweight deterministic strategy,
+- with no new learned parameters.
+
+The selected strategy for `v2` is:
+
+- `strict_sana_use_full_text_window = true`
+- `strict_sana_token_select_strategy = head_uniform_tail`
+- `strict_sana_head_tokens = 96`
+- `strict_sana_tail_tokens = 96`
+
+Meaning:
+
+- keep BOS,
+- keep a sizable head chunk,
+- keep a sizable tail chunk,
+- and sample the middle region uniformly for the remaining budget.
+
+This is attractive because it is:
+
+- zero-parameter,
+- cheap,
+- easy to ablate,
+- and much more likely to preserve lexical cues than pure tail-only truncation.
+
+## 13. The clean10k bridge-only online-teacher v2 recipe
+
+The new development recipe keeps the overall high-level setup unchanged:
+
+- dataset: `clean10k`
+- `batch_size = 16`
+- bridge-only training
+- frozen DiT weights
+- diffusion loss retained
+- online teacher retained
+
+But the conditioning/auxiliary objective is now explicitly stronger:
+
+- distill in `sana_post_ynorm` space
+- frozen SANA conditioner for target projection
+- stronger lexical residual init
+- no trainer-side pre-DiT layer norm
+- in-batch contrastive distill
+- hidden0 geometry loss
+- functional distill
+- full-window `head_uniform_tail` token selection
+
+This is intentionally still edge-conscious:
+
+- the bridge is still small,
+- the token-selection update adds no learned module,
+- and all new behavior is toggleable for clean ablation study.
+
+## 14. Early v2 evidence
+
+The `v2` run is still ongoing at the time of this note update, so the evidence is early.
+But the early trend is already meaningful.
+
+Representative early comparison against the previous bridge-only online-teacher run:
+
+- previous run, `step200`:
+  - `loss = 1.4748`
+  - `offdiag_cos = 0.8761`
+  - `mcp_offdiag = 0.9112`
+  - `cond_pred_ratio = 0.1141`
+- `v2`, `step200`:
+  - `loss = 0.7484`
+  - `offdiag_cos = 0.5042`
+  - `mcp_offdiag = 0.6024`
+  - `cond_pred_ratio = 0.0412`
+
+This should not be over-interpreted, but it is still a very important signal:
+
+- the bridge prompt space is **much less collapsed** in `v2`,
+- and that was the main objective of the redesign.
+
+Later early-run `v2` numbers also stayed in that healthier regime:
+
+- `step400`:
+  - `loss = 0.6246`
+  - `offdiag_cos = 0.5419`
+  - `mcp_offdiag = 0.6011`
+  - `cond_pred_ratio = 0.1371`
+- `step500`:
+  - `loss = 0.6031`
+  - `offdiag_cos = 0.5100`
+  - `d_nce = 1.1815`
+  - `d_h0geom = 0.1617`
+
+This is not yet evidence that generation quality is solved.
+But it is evidence that the updated bridge objective is behaving much more like the intended design.
+
+## 15. Current architecture decision after the v2 update
+
+The working hypothesis going forward is now:
+
+- keep the lexical-gated bridge,
+- keep the native-path teacher target (`post_ynorm`),
+- keep bridge-only distill as the most controlled setup,
+- and continue treating prompt geometry preservation as a first-class objective rather than a side effect.
+
+The key design lesson from this phase is:
+
+- choosing a more diverse input layer such as `hidden_0` is necessary,
+- but it is not sufficient,
+- because the bridge can still collapse that diversity later unless the target space and the auxiliary losses explicitly protect it.
+
+That is the real motivation behind the latest update series.
