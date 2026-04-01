@@ -43,9 +43,20 @@ are intentionally de-emphasized or archived.
 
 The canonical environment name is `mobileov`.
 
+Recommended path:
+
+```bash
+bash scripts/setup_mobileov_env.sh mobileov
+```
+
+Detailed environment notes:
+- [ENV_SETUP_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/ENV_SETUP_GUIDE.md)
+
 ```bash
 conda env create -f environment.yml
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 ```
 
 If the environment already exists:
@@ -53,6 +64,8 @@ If the environment already exists:
 ```bash
 conda env update -f environment.yml --prune
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 ```
 
 For OpenVid DataOps convenience commands, install the local package once:
@@ -60,6 +73,10 @@ For OpenVid DataOps convenience commands, install the local package once:
 ```bash
 pip install -e download_data
 ```
+
+All repo entrypoints below assume the two exports above are present. `PYTHONNOUSERSITE=1`
+prevents accidental conflicts from `~/.local`, and `source scripts/env_exports.sh`
+keeps in-repo imports working when launching scripts from repo root.
 
 ## Model Asset Bootstrap
 

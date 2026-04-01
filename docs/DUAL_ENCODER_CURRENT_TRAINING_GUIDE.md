@@ -24,7 +24,7 @@ Run everything from repo root and use the training env:
 cd /share_4/users/duy/project/unified_video/Omni-Video-smolvlm2
 source /share_0/conda/etc/profile.d/conda.sh
 conda activate mobileov
-export PYTHONPATH=$PWD:${PYTHONPATH:-}
+source scripts/env_exports.sh
 ```
 
 ## 2. What this recipe trains

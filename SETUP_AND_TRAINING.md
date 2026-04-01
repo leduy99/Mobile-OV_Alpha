@@ -46,9 +46,20 @@ huggingface-cli login
 
 ## 2. Create the Canonical Environment
 
+Recommended path:
+
+```bash
+bash scripts/setup_mobileov_env.sh mobileov
+```
+
+Detailed environment guide:
+- `docs/ENV_SETUP_GUIDE.md`
+
 ```bash
 conda env create -f environment.yml
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 ```
 
 If the env already exists:
@@ -56,6 +67,8 @@ If the env already exists:
 ```bash
 conda env update -f environment.yml --prune
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 ```
 
 For OpenVid DataOps commands, install the local package once:
@@ -63,6 +76,9 @@ For OpenVid DataOps commands, install the local package once:
 ```bash
 pip install -e download_data
 ```
+
+All commands below assume those two exports remain active. They prevent `~/.local`
+packages from shadowing the env and ensure repo-local imports resolve from repo root.
 
 ## 3. Model Asset Bootstrap
 

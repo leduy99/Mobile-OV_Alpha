@@ -15,11 +15,11 @@ sentencepiece==0.2.0
 # Training & Optimization
 deepspeed==0.16.6
 accelerate==1.4.0
-flash-attn==2.7.3
 xformers==0.0.29.post3
 
 # Diffusion Models
 diffusers==0.32.2
+peft==0.17.0
 
 # Computer Vision
 opencv-python-headless==4.11.0.86
@@ -36,6 +36,7 @@ matplotlib==3.10.3
 
 # Configuration & Utilities
 easydict==1.13
+omegaconf==2.3.0
 pyyaml==6.0.2
 tqdm==4.67.1
 einops==0.8.1
@@ -44,6 +45,8 @@ datasets==3.3.2
 # Monitoring & Logging
 tensorboard==2.19.0
 tensorboardx==2.6.2.2
+termcolor==2.5.0
+timm==1.0.15
 
 # Web Interface
 gradio==5.20.1
@@ -52,9 +55,10 @@ fastapi==0.115.11
 # Additional Tools
 xfuser==0.4.3.post3
 yunchang==0.6.3.post1
+qwen-vl-utils==0.0.14
 regex==2024.11.6
 requests==2.32.3
 fsspec==2024.12.0
 huggingface-hub==0.30.2
 safetensors==0.5.3
-
+--extra-index-url https://download.pytorch.org/whl/cu118

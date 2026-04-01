@@ -51,6 +51,7 @@ Use the canonical environment:
 
 ```bash
 conda activate mobileov
+source scripts/env_exports.sh
 pip install -e download_data
 ```
 

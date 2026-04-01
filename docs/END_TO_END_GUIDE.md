@@ -47,11 +47,22 @@ launchers used by the current pipeline.
 
 ## 3. Create the Conda Environment
 
+Recommended path:
+
+```bash
+bash scripts/setup_mobileov_env.sh mobileov
+```
+
+Detailed environment guide:
+- [ENV_SETUP_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/ENV_SETUP_GUIDE.md)
+
 ### Command
 
 ```bash
 conda env create -f environment.yml
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 pip install -e download_data
 ```
 
@@ -66,8 +77,13 @@ pip install -e download_data
 ```bash
 conda env update -f environment.yml --prune
 conda activate mobileov
+export PYTHONNOUSERSITE=1
+source scripts/env_exports.sh
 pip install -e download_data
 ```
+
+All commands below assume those two exports are active. They avoid user-site package
+conflicts and make repo-local imports such as `nets.*` resolve correctly.
 
 ## 4. Install System Tools
 
