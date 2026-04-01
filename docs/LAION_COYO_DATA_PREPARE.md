@@ -37,10 +37,12 @@ This repo can:
 This repo does **not** currently provide a polished crawler that discovers and
 filters LAION / COYO rows from scratch.
 
-That means you must start from one of these two inputs:
+What it **can** now do is bootstrap the source manifest from parquet metadata
+shards. That means you can start from one of these three inputs:
 
 - the exact source manifest from an existing workspace
 - your own curated source manifest
+- full parquet metadata shards stored locally or in a Hugging Face dataset repo
 
 If you want to reproduce the **exact current mix**, copy the exact manifest CSV
 from the existing server.
@@ -73,6 +75,7 @@ huggingface-cli login
 
 Main scripts:
 
+- `tools/data_prepare/bootstrap_laion_coyo_source_manifest.py`
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/merge_unified_manifest_shards.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
@@ -152,9 +155,9 @@ You should end up with:
 - an OpenVid manifest CSV
 - an encoded directory containing `sample_XXXXXXXX.pkl` files
 
-## Step 2: Obtain a LAION / COYO Source Manifest
+## Step 2: Obtain or Build a LAION / COYO Source Manifest
 
-This is the one input that the repo does not generate for you.
+This is the one input the rest of the pipeline needs.
 
 ### What the source manifest should contain
 
@@ -176,13 +179,70 @@ Useful optional columns:
 
 For the current training path, the LAION / COYO rows should be `image` rows.
 
-### Best option if you want exact reproducibility
+### Option A: best option if you want exact reproducibility
 
 Copy the exact source manifest from the existing server, for example a file such
 as:
 
 ```text
 data/laion_coyo/manifests/laion_coyo_selected_media_existing_58k.csv
+```
+
+### Option B: bootstrap a full manifest from parquet metadata
+
+If you have the original parquet metadata shards, you can now build a source
+manifest directly.
+
+#### COYO from a Hugging Face dataset repo
+
+```bash
+PYTHONPATH=. python tools/data_prepare/bootstrap_laion_coyo_source_manifest.py \
+  --preset coyo_700m \
+  --hf-repo-id kakaobrain/coyo-700m \
+  --hf-filename-glob 'data/*.parquet' \
+  --output-csv data/laion_coyo/manifests/coyo_full_source.csv
+```
+
+#### LAION from local parquet shards
+
+```bash
+PYTHONPATH=. python tools/data_prepare/bootstrap_laion_coyo_source_manifest.py \
+  --preset laion \
+  --input-glob 'data/laion_metadata/*.parquet' \
+  --output-csv data/laion_coyo/manifests/laion_full_source.csv
+```
+
+#### Merge separate dataset manifests into one source manifest
+
+```bash
+PYTHONPATH=. python tools/data_prepare/merge_unified_manifest_shards.py \
+  --input-glob 'data/laion_coyo/manifests/*_full_source.csv' \
+  --output-csv data/laion_coyo/manifests/laion_coyo_source_selected.csv
+```
+
+Notes:
+
+- Public Hugging Face dataset repos usually do **not** need `huggingface-cli login`.
+- Private, gated, or rate-limited repos may still need `huggingface-cli login`
+  or `--hf-token`.
+- The bootstrap step only creates the source manifest. The actual media still
+  gets downloaded from `source_url` during Step 3.
+
+#### When the preset column names do not match
+
+You can override the mapping explicitly:
+
+```bash
+PYTHONPATH=. python tools/data_prepare/bootstrap_laion_coyo_source_manifest.py \
+  --dataset-name my_laion \
+  --input-glob 'data/my_laion/*.parquet' \
+  --caption-column caption \
+  --url-column url \
+  --id-column sample_id \
+  --width-column width \
+  --height-column height \
+  --extra-columns similarity,license \
+  --output-csv data/laion_coyo/manifests/my_laion_source.csv
 ```
 
 ### Example environment variable used below

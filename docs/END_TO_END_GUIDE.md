@@ -294,18 +294,41 @@ The detailed step-by-step guide lives here:
 
 - [LAION_COYO_DATA_PREPARE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/LAION_COYO_DATA_PREPARE.md)
 
-### Important limitation
+### Source-manifest options
 
-The repo does not currently build a curated LAION / COYO source manifest from
-zero. You must start from:
+The repo still does not do generic web crawling or filtering for you, but it
+can now bootstrap a source manifest directly from full parquet metadata shards.
+You can start from either:
 
 - the exact source manifest copied from an existing workspace
-- or your own curated source manifest
+- your own curated source manifest
+- or parquet metadata shards stored locally or in a public / authenticated Hugging Face dataset repo
 
 ### Minimal command flow
 
 ```bash
-# 0) Point to the curated LAION / COYO source manifest you want to rebuild
+# 0) Build the source manifest.
+# Option A: use an existing curated CSV directly
+export LAION_COYO_SOURCE_MANIFEST=data/laion_coyo/manifests/laion_coyo_source_selected.csv
+
+# Option B: bootstrap COYO from parquet metadata shards in a HF dataset repo
+PYTHONPATH=. python tools/data_prepare/bootstrap_laion_coyo_source_manifest.py \
+  --preset coyo_700m \
+  --hf-repo-id kakaobrain/coyo-700m \
+  --hf-filename-glob 'data/*.parquet' \
+  --output-csv data/laion_coyo/manifests/coyo_full_source.csv
+
+# Option C: bootstrap LAION from local parquet shards
+PYTHONPATH=. python tools/data_prepare/bootstrap_laion_coyo_source_manifest.py \
+  --preset laion \
+  --input-glob 'data/laion_metadata/*.parquet' \
+  --output-csv data/laion_coyo/manifests/laion_full_source.csv
+
+# If you build LAION and COYO separately, merge them into one source manifest
+PYTHONPATH=. python tools/data_prepare/merge_unified_manifest_shards.py \
+  --input-glob 'data/laion_coyo/manifests/*_full_source.csv' \
+  --output-csv data/laion_coyo/manifests/laion_coyo_source_selected.csv
+
 export LAION_COYO_SOURCE_MANIFEST=data/laion_coyo/manifests/laion_coyo_source_selected.csv
 
 # 1) Download raw media referenced by the source manifest

@@ -134,7 +134,9 @@ See:
 
 ### LAION / COYO
 Current repo support is manifest-based rather than one-shot raw crawling.
+That now includes a bootstrap path from full parquet metadata shards.
 Canonical tools are:
+- `tools/data_prepare/bootstrap_laion_coyo_source_manifest.py`
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
 - `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`

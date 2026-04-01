@@ -173,11 +173,13 @@ For a robust OpenVid workflow, use the bundled DataOps package:
 The current workflow is manifest-based.
 
 Typical steps are:
-1. materialize raw media from a unified manifest
-2. recover unique LAION image files if needed
-3. encode image rows into WAN VAE latents
+1. bootstrap a source manifest from parquet metadata or start from an existing manifest
+2. materialize raw media from a unified manifest
+3. recover unique LAION image files if needed
+4. encode image rows into WAN VAE latents
 
 Canonical scripts:
+- `tools/data_prepare/bootstrap_laion_coyo_source_manifest.py`
 - `tools/data_prepare/materialize_unified_manifest.py`
 - `tools/data_prepare/recover_laion_images_unique.py`
 - `tools/data_prepare/encode_laion_coyo_images_sana_ar.py`
