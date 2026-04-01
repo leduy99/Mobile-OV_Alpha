@@ -22,6 +22,7 @@ in this repository:
 - OpenVid download and WAN VAE encoding
 - MSR-VTT download and WAN VAE encoding
 - LAION / COYO full-mix preparation from a source manifest
+- Mobile-O-SFT image-generation preparation and training
 - 3-stage SmolVLM2 + bridge + SANA training
 - checkpoint-based video inference with the fixed backend
 
@@ -55,6 +56,9 @@ bash scripts/setup_mobileov_env.sh mobileov
 
 Detailed environment guide:
 - [ENV_SETUP_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/ENV_SETUP_GUIDE.md)
+
+Dataset-specific guide for `Amshaker/Mobile-O-SFT`:
+- [MOBILE_O_SFT_TRAINING_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/MOBILE_O_SFT_TRAINING_GUIDE.md)
 
 ### Command
 
