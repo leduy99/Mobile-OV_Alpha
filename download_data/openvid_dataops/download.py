@@ -3,6 +3,7 @@ import logging
 import shutil
 import subprocess
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -169,6 +170,7 @@ def download_openvid(
     extract: bool,
     keep_zip: bool,
     include_csv: bool,
+    jobs: int = 1,
 ) -> None:
     ensure_layout(layout)
 
@@ -206,7 +208,9 @@ def download_openvid(
     else:
         remote_ids = parts_to_remote_ids(parts_user, part_index_base=part_index_base)
 
-    for part_user, remote_id in zip(parts_user, remote_ids):
+    jobs = max(1, int(jobs))
+
+    def _process_one(part_user: int, remote_id: int) -> DownloadRecord:
         zip_name = f"OpenVid_part{remote_id}.zip"
         zip_path = layout.zip_root / zip_name
         extracted_dir = layout.parts_root / f"part_{part_user:04d}"
@@ -230,19 +234,46 @@ def download_openvid(
             if not keep_zip:
                 _clean_file(zip_path)
 
-        records.append(
-            DownloadRecord(
-                part_user=part_user,
-                part_remote=remote_id,
-                zip_path=str(zip_path),
-                extracted_dir=str(extracted_dir),
-                downloaded=downloaded,
-                extracted=extracted_ok,
-                source_type=source_type,
-                source_files=source_files,
-                ts_utc=datetime.now(timezone.utc).isoformat(),
-            )
+        return DownloadRecord(
+            part_user=part_user,
+            part_remote=remote_id,
+            zip_path=str(zip_path),
+            extracted_dir=str(extracted_dir),
+            downloaded=downloaded,
+            extracted=extracted_ok,
+            source_type=source_type,
+            source_files=source_files,
+            ts_utc=datetime.now(timezone.utc).isoformat(),
         )
+
+    part_pairs = list(zip(parts_user, remote_ids))
+    LOGGER.info(
+        "Downloading OpenVid parts: count=%d jobs=%d extract=%s keep_zip=%s",
+        len(part_pairs),
+        jobs,
+        extract,
+        keep_zip,
+    )
+
+    if jobs == 1:
+        for part_user, remote_id in part_pairs:
+            records.append(_process_one(part_user, remote_id))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            future_map = {
+                executor.submit(_process_one, part_user, remote_id): (part_user, remote_id)
+                for part_user, remote_id in part_pairs
+            }
+            for future in as_completed(future_map):
+                part_user, remote_id = future_map[future]
+                try:
+                    records.append(future.result())
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to download/extract part user={part_user} remote={remote_id}"
+                    ) from exc
+
+    records.sort(key=lambda r: r.part_user)
 
     state_path = layout.state_root / "download_state.json"
     payload = {

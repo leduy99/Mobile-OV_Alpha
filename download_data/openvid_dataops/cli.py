@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_dl.add_argument("--extract", action="store_true", help="Extract zip after download")
     p_dl.add_argument("--keep-zip", action="store_true", help="Keep zip files after extraction")
     p_dl.add_argument("--no-csv", action="store_true", help="Do not download OpenVid CSV")
+    p_dl.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of parts to download/extract in parallel within one process (default: 1)",
+    )
 
     p_mf = sub.add_parser("build-manifest", help="Build manifest from extracted parts + OpenVid CSV")
     _common_root_arg(p_mf)
@@ -100,6 +106,7 @@ def main() -> None:
             extract=args.extract,
             keep_zip=args.keep_zip,
             include_csv=(not args.no_csv),
+            jobs=args.jobs,
         )
         return
 
