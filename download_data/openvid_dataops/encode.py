@@ -2,9 +2,10 @@ import json
 import logging
 import os
 import pickle
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -130,6 +131,70 @@ def read_video_frames(
     return _transform_frames_to_tensor(frames, target_size)
 
 
+def _load_existing_fail_rows(fail_path: Path) -> List[Dict[str, object]]:
+    if not fail_path.exists():
+        return []
+    try:
+        df = pd.read_csv(fail_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.warning("Could not read existing failure CSV %s: %s", fail_path, exc)
+        return []
+    return df.to_dict(orient="records")
+
+
+def _write_fail_csv(fail_rows: List[Dict[str, object]], fail_path: Path) -> None:
+    if not fail_rows:
+        return
+    pd.DataFrame(fail_rows).to_csv(fail_path, index=False)
+
+
+def _write_summary(
+    summary_path: Path,
+    *,
+    rank: int,
+    world_size: int,
+    manifest_csv: Path,
+    output_dir: Path,
+    done: int,
+    skipped: int,
+    failed: int,
+    fail_path: Path,
+    has_fail_rows: bool,
+    last_row_idx: Optional[int],
+    last_sample_idx: Optional[int],
+    status: str,
+) -> None:
+    summary = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "rank": rank,
+        "world_size": world_size,
+        "manifest_csv": str(manifest_csv),
+        "output_dir": str(output_dir),
+        "done": done,
+        "skipped": skipped,
+        "failed": failed,
+        "failed_csv": str(fail_path) if has_fail_rows else None,
+        "last_row_idx": last_row_idx,
+        "last_sample_idx": last_sample_idx,
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def _atomic_pickle_dump(item: Dict[str, object], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        dir=out_path.parent,
+        prefix=f".{out_path.stem}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp_f:
+        tmp_path = Path(tmp_f.name)
+        pickle.dump(item, tmp_f)
+    tmp_path.replace(out_path)
+
+
 def encode_manifest(
     ckpt_dir: Path,
     manifest_csv: Path,
@@ -178,7 +243,25 @@ def encode_manifest(
     done = 0
     skipped = 0
     failed = 0
-    fail_rows = []
+    fail_rows = _load_existing_fail_rows(fail_path)
+    last_row_idx: Optional[int] = None
+    last_sample_idx: Optional[int] = None
+
+    _write_summary(
+        summary_path,
+        rank=rank,
+        world_size=world_size,
+        manifest_csv=manifest_csv,
+        output_dir=output_dir,
+        done=done,
+        skipped=skipped,
+        failed=failed,
+        fail_path=fail_path,
+        has_fail_rows=bool(fail_rows),
+        last_row_idx=last_row_idx,
+        last_sample_idx=last_sample_idx,
+        status="running",
+    )
 
     with torch.no_grad():
         for row_idx, row in df.iterrows():
@@ -186,17 +269,60 @@ def encode_manifest(
                 continue
 
             sample_idx = int(row.get("sample_idx", row_idx))
+            last_row_idx = int(row_idx)
+            last_sample_idx = int(sample_idx)
             video_path = Path(str(row["video_path"]))
             prompt = str(row.get("caption", ""))
 
             out_path = output_dir / f"sample_{sample_idx:08d}.pkl"
             if out_path.exists():
                 skipped += 1
+                processed = done + skipped + failed
+                if processed % max(1, log_every) == 0:
+                    LOGGER.info("Rank %d progress: done=%d skipped=%d failed=%d", rank, done, skipped, failed)
+                    _write_summary(
+                        summary_path,
+                        rank=rank,
+                        world_size=world_size,
+                        manifest_csv=manifest_csv,
+                        output_dir=output_dir,
+                        done=done,
+                        skipped=skipped,
+                        failed=failed,
+                        fail_path=fail_path,
+                        has_fail_rows=bool(fail_rows),
+                        last_row_idx=last_row_idx,
+                        last_sample_idx=last_sample_idx,
+                        status="running",
+                    )
                 continue
 
             if not video_path.exists():
                 failed += 1
-                fail_rows.append({"sample_idx": sample_idx, "video_path": str(video_path), "reason": "missing_video"})
+                fail_rows.append(
+                    {
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "sample_idx": sample_idx,
+                        "video_path": str(video_path),
+                        "reason": "missing_video",
+                    }
+                )
+                _write_fail_csv(fail_rows, fail_path)
+                _write_summary(
+                    summary_path,
+                    rank=rank,
+                    world_size=world_size,
+                    manifest_csv=manifest_csv,
+                    output_dir=output_dir,
+                    done=done,
+                    skipped=skipped,
+                    failed=failed,
+                    fail_path=fail_path,
+                    has_fail_rows=True,
+                    last_row_idx=last_row_idx,
+                    last_sample_idx=last_sample_idx,
+                    status="running",
+                )
                 continue
 
             try:
@@ -226,32 +352,71 @@ def encode_manifest(
                     "skip_num": skip_num,
                     "latent_feature": latent_feature,
                 }
-                with out_path.open("wb") as f:
-                    pickle.dump(item, f)
+                _atomic_pickle_dump(item, out_path)
                 done += 1
 
-                if done % max(1, log_every) == 0:
+                processed = done + skipped + failed
+                if processed % max(1, log_every) == 0:
                     LOGGER.info("Rank %d progress: done=%d skipped=%d failed=%d", rank, done, skipped, failed)
+                    _write_summary(
+                        summary_path,
+                        rank=rank,
+                        world_size=world_size,
+                        manifest_csv=manifest_csv,
+                        output_dir=output_dir,
+                        done=done,
+                        skipped=skipped,
+                        failed=failed,
+                        fail_path=fail_path,
+                        has_fail_rows=bool(fail_rows),
+                        last_row_idx=last_row_idx,
+                        last_sample_idx=last_sample_idx,
+                        status="running",
+                    )
 
             except Exception as exc:  # pylint: disable=broad-except
                 failed += 1
-                fail_rows.append({"sample_idx": sample_idx, "video_path": str(video_path), "reason": str(exc)})
+                fail_rows.append(
+                    {
+                        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "sample_idx": sample_idx,
+                        "video_path": str(video_path),
+                        "reason": str(exc),
+                    }
+                )
+                _write_fail_csv(fail_rows, fail_path)
+                _write_summary(
+                    summary_path,
+                    rank=rank,
+                    world_size=world_size,
+                    manifest_csv=manifest_csv,
+                    output_dir=output_dir,
+                    done=done,
+                    skipped=skipped,
+                    failed=failed,
+                    fail_path=fail_path,
+                    has_fail_rows=True,
+                    last_row_idx=last_row_idx,
+                    last_sample_idx=last_sample_idx,
+                    status="running",
+                )
 
-    if fail_rows:
-        pd.DataFrame(fail_rows).to_csv(fail_path, index=False)
-
-    summary = {
-        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "rank": rank,
-        "world_size": world_size,
-        "manifest_csv": str(manifest_csv),
-        "output_dir": str(output_dir),
-        "done": done,
-        "skipped": skipped,
-        "failed": failed,
-        "failed_csv": str(fail_path) if fail_rows else None,
-    }
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _write_fail_csv(fail_rows, fail_path)
+    _write_summary(
+        summary_path,
+        rank=rank,
+        world_size=world_size,
+        manifest_csv=manifest_csv,
+        output_dir=output_dir,
+        done=done,
+        skipped=skipped,
+        failed=failed,
+        fail_path=fail_path,
+        has_fail_rows=bool(fail_rows),
+        last_row_idx=last_row_idx,
+        last_sample_idx=last_sample_idx,
+        status="finished",
+    )
     LOGGER.info("Rank %d summary saved: %s", rank, summary_path)
 
     if world_size > 1 and dist.is_initialized():

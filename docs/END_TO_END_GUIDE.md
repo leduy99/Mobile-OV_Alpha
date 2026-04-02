@@ -223,6 +223,9 @@ python -m openvid_dataops encode \
 - raw OpenVid files under `download_data/data/openvid/raw/`
 - manifest CSV under `download_data/data/openvid/manifests/`
 - latent pickles under `download_data/data/openvid/encoded/wan_vae_openvid_all/`
+- resume metadata under the same encoded folder:
+  - `summary_rankXX.json`
+  - `failed_rankXX.csv`
 
 ### Important arguments
 
@@ -236,6 +239,17 @@ python -m openvid_dataops encode \
 - `--sampling-rate`: frame stride; `1` means dense sampling
 - `--target-size`: encoded spatial size in `H,W`; current canonical value is `480,832`
 - `--output-subdir`: folder name under `download_data/data/openvid/encoded/`
+
+### If OpenVid encoding gets interrupted
+
+Rerun the same `openvid_dataops encode` command with the same `--output-subdir`.
+The encoder skips any existing `sample_XXXXXXXX.pkl`, so it continues from the
+remaining samples instead of starting from zero.
+
+To inspect the interrupted run:
+
+- `summary_rankXX.json`: latest per-rank progress and the last processed sample
+- `failed_rankXX.csv`: failed samples and the reason string captured by the encoder
 
 ## 10. MSR-VTT: Download and Encode
 

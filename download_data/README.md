@@ -306,6 +306,30 @@ Use the multi-GPU wrapper:
 bash download_data/scripts/run_encode_4gpu.sh ...
 ```
 
+### An encode job was interrupted and I want to continue
+
+Rerun the exact same encode command with the same `--output-subdir`.
+Existing `sample_XXXXXXXX.pkl` files are skipped automatically, so the encoder
+continues from the remaining samples.
+
+Progress and failures are written under the encoded output directory:
+
+- `summary_rankXX.json`: latest rank progress, including `last_row_idx` and `last_sample_idx`
+- `failed_rankXX.csv`: failed samples and their reasons
+
+Example:
+
+```bash
+python -m openvid_dataops encode \
+  --manifest-csv download_data/data/openvid/manifests/openvid_all.csv \
+  --ckpt-dir download_data/checkpoints/wan/wanxiang1_3b \
+  --task t2v-1.3B \
+  --frame-num 81 \
+  --sampling-rate 1 \
+  --target-size 480,832 \
+  --output-subdir wan_vae_openvid_all
+```
+
 ### I only want a subset first
 
 Use:
