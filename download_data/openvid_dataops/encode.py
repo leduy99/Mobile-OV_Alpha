@@ -84,6 +84,39 @@ def _transform_frames_to_tensor(frames, target_size=(480, 832)) -> torch.Tensor:
     return torch.stack(out)
 
 
+def _build_temporal_sample_indices(
+    total_frames: int,
+    frame_num: int,
+    sampling_rate: int,
+    skip_num: int,
+    source_fps: float,
+    target_fps: float = 16.0,
+) -> Optional[np.ndarray]:
+    available_frames = int(total_frames) - int(skip_num)
+    if frame_num <= 0 or available_frames <= 0:
+        return None
+
+    # Follow the SANA temporal contract: num_frames = N_seconds * 16 + 1.
+    # For the common case frame_num=81 and sampling_rate=1, this maps to a 5s
+    # clip sampled on a 16fps timeline.
+    stride = max(1, int(sampling_rate))
+    effective_target_fps = float(target_fps) / float(stride)
+    if effective_target_fps <= 0:
+        return None
+
+    if not np.isfinite(source_fps) or source_fps <= 0:
+        source_fps = float(target_fps)
+
+    target_span_sec = float(max(frame_num - 1, 0)) / effective_target_fps
+    available_span_sec = float(max(available_frames - 1, 0)) / float(source_fps)
+    sample_span_sec = min(target_span_sec, available_span_sec)
+
+    timestamps = np.linspace(0.0, sample_span_sec, num=frame_num, dtype=np.float64)
+    rel_indices = np.rint(timestamps * float(source_fps)).astype(np.int64)
+    rel_indices = np.clip(rel_indices, 0, available_frames - 1)
+    return rel_indices + int(skip_num)
+
+
 def read_video_frames(
     video_path: str,
     frame_num: int,
@@ -96,14 +129,12 @@ def read_video_frames(
         return None
 
     total_frames = _get_video_frame_count_fast(cap)
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    while total_frames < frame_num * sampling_rate + skip_num:
-        sampling_rate -= 1
-        if sampling_rate <= 0:
-            cap.release()
-            return None
+    if total_frames <= skip_num:
+        cap.release()
+        return None
 
     if (target_size[0] > target_size[1] and height < width) or (
         target_size[0] < target_size[1] and height > width
@@ -111,22 +142,43 @@ def read_video_frames(
         cap.release()
         return None
 
+    sample_indices = _build_temporal_sample_indices(
+        total_frames=total_frames,
+        frame_num=frame_num,
+        sampling_rate=sampling_rate,
+        skip_num=skip_num,
+        source_fps=fps,
+    )
+    if sample_indices is None or len(sample_indices) == 0:
+        cap.release()
+        return None
+
+    needed_counts: Dict[int, int] = {}
+    for idx in sample_indices.tolist():
+        needed_counts[int(idx)] = needed_counts.get(int(idx), 0) + 1
+
     frames = []
     current = 0
-    while current < total_frames:
+    while current < total_frames and needed_counts:
         ret, frame = cap.read()
         if not ret:
             break
-        if current >= skip_num and (current - skip_num) % sampling_rate == 0:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame)
+
+        repeat = needed_counts.pop(current, 0)
+        if repeat:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            for _ in range(repeat):
+                frames.append(frame_rgb.copy())
         current += 1
-        if len(frames) >= frame_num:
-            break
     cap.release()
 
-    if len(frames) != frame_num:
+    if len(frames) == 0:
         return None
+
+    if len(frames) < frame_num:
+        frames.extend([frames[-1].copy()] * (frame_num - len(frames)))
+    elif len(frames) > frame_num:
+        frames = frames[:frame_num]
 
     return _transform_frames_to_tensor(frames, target_size)
 
