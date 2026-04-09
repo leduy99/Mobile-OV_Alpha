@@ -1,7 +1,8 @@
 # Local WebDataset Image Data Guide
 
 This guide explains how to process a local image/text WebDataset tar dataset into
-the repo's final image-training format with one command.
+the repo's final image-training format with one command, then train it with the
+ready-made image-only `ver 1` and `ver 2` recipes in this repo.
 
 It covers datasets stored like this:
 
@@ -25,6 +26,11 @@ The new one-command entrypoint is:
 
 - [prepare_local_wds_image_dataset.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/prepare_local_wds_image_dataset.sh)
 
+The ready-to-run training entrypoints are:
+
+- [train_local_wds_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_local_wds_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh)
+- [train_local_wds_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_local_wds_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh)
+
 Under the hood it uses:
 
 - [bootstrap_local_wds_source_manifest.py](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/tools/data_prepare/bootstrap_local_wds_source_manifest.py)
@@ -43,6 +49,8 @@ Running the script once will:
 6. write a final train-ready manifest CSV
 
 The final train-ready CSV is what the existing image-training configs should use.
+If you keep the default output location, the ready-made `ver 1` and `ver 2`
+training configs will point at it automatically.
 
 ## 2. Environment
 
@@ -59,27 +67,35 @@ export PYTHONPATH=.
 
 ## 3. One-command usage
 
-Example for JourneyDB:
+Zero-edit example for JourneyDB:
 
 ```bash
 bash scripts/prepare_local_wds_image_dataset.sh \
   --input-root /proj/cvl/users/x_fahkh2/BLIP3o/dataset/BLIP3o-Pretrain-JourneyDB \
-  --output-root data/blip3o_pretrain_journeydb \
-  --dataset-name blip3o_pretrain_journeydb \
   --bootstrap-jobs 8 \
   --nproc-per-node 1
 ```
 
-Example for Short Caption:
+Zero-edit example for Short Caption:
 
 ```bash
 bash scripts/prepare_local_wds_image_dataset.sh \
   --input-root /proj/cvl/users/x_fahkh2/BLIP3o/dataset/BLIP3o-Pretrain-Short-Caption \
-  --output-root data/blip3o_pretrain_short_caption \
-  --dataset-name blip3o_pretrain_short_caption \
   --bootstrap-jobs 8 \
   --nproc-per-node 1
 ```
+
+By default, this writes:
+
+```text
+data/local_wds_image/manifests/local_wds_image_source.csv
+data/local_wds_image/encoded/wan_vae_sana_ar/sample_00000000.pkl
+data/local_wds_image/manifests/local_wds_image_train_ready.csv
+```
+
+This zero-edit path is meant for one dataset at a time. If you want to keep
+multiple prepared datasets side by side, use custom `--output-root` and
+`--dataset-name`, then patch the training configs as described below.
 
 If you want to process only a subset of tar shards:
 
@@ -140,3 +156,80 @@ data/blip3o_pretrain_journeydb/
 - rebuilding the train-ready manifest is always safe
 
 This makes reruns suitable for partial resumes.
+
+## 8. Ready-to-run image-only training configs
+
+Two training configs are now included for the default local-WDS output path:
+
+- `ver 1`: [stage1_teacher_free_local_wds_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260410.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_local_wds_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260410.yaml)
+- `ver 2`: [stage1_teacher_free_local_wds_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260410.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_local_wds_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260410.yaml)
+
+These assume:
+
+- train-ready CSV: `data/local_wds_image/manifests/local_wds_image_train_ready.csv`
+- image-only latent contract: `expected_latent_t: 1`
+- image-only frame contract: `expected_frame_num: 1`
+- full-dataset usage: `max_samples: null`
+
+## 9. Train image-only `ver 1`
+
+`ver 1` in this repo means:
+
+- bridge-only training
+- projector type: `mcp_full`
+- `mcp_num_fuse_layers: 4`
+- online teacher losses enabled
+
+Run:
+
+```bash
+bash scripts/train_local_wds_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh
+```
+
+## 10. Train image-only `ver 2`
+
+`ver 2` in this repo means:
+
+- bridge-only training
+- projector type: `mcp_lexical_gated`
+- `mcp_num_fuse_layers: 2`
+- online teacher losses enabled
+
+Run:
+
+```bash
+bash scripts/train_local_wds_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh
+```
+
+Both launchers:
+
+- use `tools/train_stage1_teacher_free.py`
+- default to `CUDA_VISIBLE_DEVICES=0`
+- write logs under `output/logs/`
+
+## 11. If you used a custom output root or dataset name
+
+The zero-edit training path assumes the default prep output:
+
+```text
+data/local_wds_image/manifests/local_wds_image_train_ready.csv
+```
+
+If you used custom values such as:
+
+- `--output-root data/blip3o_pretrain_journeydb`
+- `--dataset-name blip3o_pretrain_journeydb`
+
+then patch these three fields in both configs before training:
+
+- `data.openvid.csv_path`
+- `data.openvid.csv_path_video`
+- `data.openvid.csv_path_image`
+
+All three should point to the same image-only manifest:
+
+```text
+data/blip3o_pretrain_journeydb/manifests/blip3o_pretrain_journeydb_train_ready.csv
+```
+
+The rest of the image-only settings can stay as they are.

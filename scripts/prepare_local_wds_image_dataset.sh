@@ -6,8 +6,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 INPUT_ROOT=""
-OUTPUT_ROOT=""
-DATASET_NAME=""
+OUTPUT_ROOT="data/local_wds_image"
+DATASET_NAME="local_wds_image"
 FILENAMES="all"
 BOOTSTRAP_JOBS=8
 BOOTSTRAP_LOG_EVERY=1000
@@ -24,8 +24,8 @@ usage() {
 Usage:
   bash scripts/prepare_local_wds_image_dataset.sh \
     --input-root /path/to/local_wds_dir \
-    --output-root data/local_wds_run \
-    --dataset-name local_wds_run \
+    [--output-root data/local_wds_image] \
+    [--dataset-name local_wds_image] \
     [--filenames all] \
     [--bootstrap-jobs 8] \
     [--bootstrap-log-every 1000] \
@@ -109,8 +109,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -z "${INPUT_ROOT}" || -z "${OUTPUT_ROOT}" || -z "${DATASET_NAME}" ]]; then
-  echo "--input-root, --output-root, and --dataset-name are required." >&2
+if [[ -z "${INPUT_ROOT}" ]]; then
+  echo "--input-root is required." >&2
   usage >&2
   exit 1
 fi

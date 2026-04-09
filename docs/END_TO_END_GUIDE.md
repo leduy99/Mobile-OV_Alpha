@@ -24,7 +24,7 @@ in this repository:
 - LAION / COYO full-mix preparation from a source manifest
 - Mobile-O-SFT image-generation preparation and training
 - Mobile-O-Pre-Train image data preparation and encoding
-- Local image/text WebDataset tar preparation into train-ready image manifests
+- Local image/text WebDataset tar preparation into train-ready image manifests and image-only training
 - 3-stage SmolVLM2 + bridge + SANA training
 - checkpoint-based video inference with the fixed backend
 
