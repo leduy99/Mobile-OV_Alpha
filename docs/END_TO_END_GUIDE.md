@@ -24,6 +24,7 @@ in this repository:
 - LAION / COYO full-mix preparation from a source manifest
 - Mobile-O-SFT image-generation preparation and training
 - Mobile-O-Pre-Train image data preparation and encoding
+- Local image/text WebDataset tar preparation into train-ready image manifests
 - 3-stage SmolVLM2 + bridge + SANA training
 - checkpoint-based video inference with the fixed backend
 
@@ -63,6 +64,9 @@ Dataset-specific guide for `Amshaker/Mobile-O-SFT`:
 
 Dataset-specific guide for `Amshaker/Mobile-O-Pre-Train`:
 - [MOBILE_O_PRETRAIN_DATA_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/MOBILE_O_PRETRAIN_DATA_GUIDE.md)
+
+Dataset-specific guide for local image/text WebDataset tar directories:
+- [LOCAL_WDS_IMAGE_DATA_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/LOCAL_WDS_IMAGE_DATA_GUIDE.md)
 
 ### Command
 

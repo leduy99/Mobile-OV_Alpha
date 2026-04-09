@@ -224,6 +224,14 @@ def encode_images(
     if fail_rows:
         pd.DataFrame(fail_rows).to_csv(fail_csv, index=False)
 
+    LOGGER.info(
+        "Rank %d final counts: done=%d skipped=%d failed=%d",
+        rank,
+        done,
+        skipped,
+        failed,
+    )
+
     summary = {
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         "rank": rank,
