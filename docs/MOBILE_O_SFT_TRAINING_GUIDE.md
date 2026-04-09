@@ -84,7 +84,8 @@ To process the full dataset:
 python tools/data_prepare/bootstrap_mobile_o_sft_source_manifest.py \
   --filenames all \
   --output-root data/mobile_o_sft_full \
-  --jobs 8
+  --jobs 8 \
+  --log-every 1000
 ```
 
 Notes:
@@ -92,6 +93,8 @@ Notes:
 - `--jobs` parallelizes across tar shards.
 - Start with `--jobs 4` or `--jobs 8`.
 - Increase only if network and disk are stable.
+- The bootstrap script now prints shard start, periodic progress, shard finish,
+  and final manifest-write logs to the terminal.
 
 If you want a subset of specific shards:
 

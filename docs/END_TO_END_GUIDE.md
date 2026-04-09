@@ -23,6 +23,7 @@ in this repository:
 - MSR-VTT download and WAN VAE encoding
 - LAION / COYO full-mix preparation from a source manifest
 - Mobile-O-SFT image-generation preparation and training
+- Mobile-O-Pre-Train image data preparation and encoding
 - 3-stage SmolVLM2 + bridge + SANA training
 - checkpoint-based video inference with the fixed backend
 
@@ -59,6 +60,9 @@ Detailed environment guide:
 
 Dataset-specific guide for `Amshaker/Mobile-O-SFT`:
 - [MOBILE_O_SFT_TRAINING_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/MOBILE_O_SFT_TRAINING_GUIDE.md)
+
+Dataset-specific guide for `Amshaker/Mobile-O-Pre-Train`:
+- [MOBILE_O_PRETRAIN_DATA_GUIDE.md](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/docs/MOBILE_O_PRETRAIN_DATA_GUIDE.md)
 
 ### Command
 

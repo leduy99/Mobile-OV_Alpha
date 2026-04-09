@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Shared bootstrap logic for Mobile-O WebDataset image/text corpora."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import csv
+import hashlib
+import io
+import json
+import logging
+import tarfile
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Tuple
+
+import requests
+from huggingface_hub import hf_hub_url, list_repo_files
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+LOGGER = logging.getLogger(__name__)
+
+IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "bmp"}
+TEXT_EXTS = {"txt", "text", "caption"}
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def parse_args(
+    *,
+    description: str,
+    default_repo_id: str,
+    default_output_root: str,
+    default_dataset_name: str,
+    default_filenames: str,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--repo-id", default=default_repo_id)
+    parser.add_argument(
+        "--filenames",
+        default=default_filenames,
+        help="Comma-separated tar filenames to process, or 'all' for every .tar shard.",
+    )
+    parser.add_argument(
+        "--output-root",
+        default=default_output_root,
+        help="Root directory for raw images and manifests.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Optional manifest CSV path. Defaults to <output-root>/manifests/<dataset>_source.csv",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Stop after writing this many paired samples total. Omit for full dataset.",
+    )
+    parser.add_argument(
+        "--start-sample-idx",
+        type=int,
+        default=0,
+        help="Starting sample_idx value in the output manifest.",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        default=default_dataset_name,
+        help="Dataset name to write into the manifest.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="HTTP timeout in seconds for shard requests.",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Number of tar shards to process in parallel. Use 1 for sequential processing.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=1000,
+        help="Emit an in-shard progress log every N paired samples. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing image files and manifest rows.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        default=None,
+        help="Optional Hugging Face token. Public Mobile-O datasets do not require one.",
+    )
+    return parser.parse_args()
+
+
+def _resolve_filenames(repo_id: str, filenames_arg: str) -> List[str]:
+    if filenames_arg.strip().lower() != "all":
+        filenames = [x.strip() for x in filenames_arg.split(",") if x.strip()]
+        LOGGER.info("Using %d explicitly requested shard(s)", len(filenames))
+        return filenames
+    LOGGER.info("Resolving all tar shards from dataset repo %s", repo_id)
+    files = list_repo_files(repo_id, repo_type="dataset")
+    filenames = sorted(f for f in files if f.endswith(".tar"))
+    LOGGER.info("Resolved %d tar shard(s) from %s", len(filenames), repo_id)
+    return filenames
+
+
+def _member_key(name: str) -> Tuple[str, str]:
+    base = Path(name).name
+    if "." not in base:
+        return base, ""
+    stem, ext = base.rsplit(".", 1)
+    return stem, ext.lower()
+
+
+def _iter_wds_pairs(url: str, token: Optional[str], timeout: int) -> Iterator[Tuple[str, Dict]]:
+    headers = {"Authorization": f"Bearer {token}"} if token else None
+    pending: Dict[str, Dict] = {}
+    with requests.get(url, stream=True, timeout=timeout, headers=headers) as response:
+        response.raise_for_status()
+        tf = tarfile.open(fileobj=response.raw, mode="r|*")
+        for member in tf:
+            if not member.isfile():
+                continue
+            key, ext = _member_key(member.name)
+            if ext not in IMAGE_EXTS and ext not in TEXT_EXTS:
+                continue
+            extracted = tf.extractfile(member)
+            if extracted is None:
+                continue
+            payload = extracted.read()
+            record = pending.setdefault(key, {})
+            if ext in IMAGE_EXTS:
+                record["image_bytes"] = payload
+                record["image_ext"] = ext
+                record["member_name"] = member.name
+            elif ext in TEXT_EXTS:
+                record["caption"] = payload.decode("utf-8", errors="replace").strip()
+            if "image_bytes" in record and "caption" in record:
+                yield key, record
+                pending.pop(key, None)
+
+
+def _save_image(image_bytes: bytes, ext: str, out_path: Path) -> Tuple[int, int]:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fmt = "JPEG" if ext in {"jpg", "jpeg"} else ext.upper()
+    save_kwargs = {"format": fmt}
+    if fmt == "JPEG":
+        save_kwargs["quality"] = 95
+    image.save(out_path, **save_kwargs)
+    width, height = image.size
+    return width, height
+
+
+def _source_id(shard_name: str, key: str) -> str:
+    return f"{Path(shard_name).stem}:{key}"
+
+
+def _process_shard(
+    repo_id: str,
+    shard_name: str,
+    images_dir: Path,
+    dataset_name: str,
+    token: Optional[str],
+    timeout: int,
+    overwrite: bool,
+    log_every: int,
+    max_samples: Optional[int] = None,
+) -> Tuple[str, List[Dict], int]:
+    shard_url = hf_hub_url(repo_id, shard_name, repo_type="dataset")
+    shard_rows: List[Dict] = []
+    total_seen = 0
+
+    LOGGER.info("Starting shard %s", shard_name)
+
+    for key, record in _iter_wds_pairs(shard_url, token=token, timeout=timeout):
+        total_seen += 1
+        caption = str(record.get("caption", "")).strip()
+        if not caption:
+            continue
+
+        ext = str(record.get("image_ext", "jpg")).lower()
+        out_path = images_dir / shard_name.replace(".tar", "") / f"{key}.{ext}"
+        if out_path.exists() and not overwrite:
+            width = height = -1
+            try:
+                with Image.open(out_path) as im:
+                    width, height = im.size
+            except Exception:
+                pass
+        else:
+            width, height = _save_image(record["image_bytes"], ext, out_path)
+
+        shard_rows.append(
+            {
+                "dataset": dataset_name,
+                "modality": "image",
+                "caption": caption,
+                "image_path": str(out_path),
+                "media_path": str(out_path),
+                "video_path": "",
+                "source_id": _source_id(shard_name, key),
+                "source_url": shard_url,
+                "width": width,
+                "height": height,
+                "extra_json": json.dumps(
+                    {
+                        "shard": shard_name,
+                        "member_name": record.get("member_name", ""),
+                        "key": key,
+                        "caption_sha1": hashlib.sha1(caption.encode("utf-8")).hexdigest(),
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        )
+
+        if log_every > 0 and total_seen % log_every == 0:
+            LOGGER.info(
+                "Shard %s progress: seen_pairs=%d written_rows=%d last_key=%s",
+                shard_name,
+                total_seen,
+                len(shard_rows),
+                key,
+            )
+
+        if max_samples is not None and len(shard_rows) >= max_samples:
+            LOGGER.info(
+                "Shard %s reached local max_samples=%d; stopping early",
+                shard_name,
+                max_samples,
+            )
+            break
+
+    LOGGER.info(
+        "Finished shard %s: seen_pairs=%d written_rows=%d",
+        shard_name,
+        total_seen,
+        len(shard_rows),
+    )
+    return shard_name, shard_rows, total_seen
+
+
+def _write_manifest(rows: List[Dict], output_csv: Path) -> None:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "sample_idx",
+        "dataset",
+        "modality",
+        "caption",
+        "image_path",
+        "media_path",
+        "video_path",
+        "source_id",
+        "source_url",
+        "width",
+        "height",
+        "extra_json",
+    ]
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def run_bootstrap(
+    *,
+    description: str,
+    default_repo_id: str,
+    default_output_root: str,
+    default_dataset_name: str,
+    default_filenames: str,
+) -> None:
+    _configure_logging()
+    args = parse_args(
+        description=description,
+        default_repo_id=default_repo_id,
+        default_output_root=default_output_root,
+        default_dataset_name=default_dataset_name,
+        default_filenames=default_filenames,
+    )
+
+    output_root = Path(args.output_root).resolve()
+    images_dir = output_root / "raw" / "images"
+    default_csv_name = f"{args.dataset_name}_source.csv"
+    output_csv = Path(args.output_csv).resolve() if args.output_csv else output_root / "manifests" / default_csv_name
+
+    filenames = _resolve_filenames(args.repo_id, args.filenames)
+    sample_idx = int(args.start_sample_idx)
+    total_seen = 0
+    total_written = 0
+    rows: List[Dict] = []
+
+    effective_jobs = max(1, int(args.jobs))
+    if args.max_samples is not None and effective_jobs > 1:
+        LOGGER.info(
+            "max_samples=%s requires exact ordering; forcing sequential processing instead of jobs=%d",
+            args.max_samples,
+            effective_jobs,
+        )
+        effective_jobs = 1
+
+    LOGGER.info(
+        "Bootstrap start: repo_id=%s shards=%d output_root=%s jobs=%d max_samples=%s overwrite=%s",
+        args.repo_id,
+        len(filenames),
+        output_root,
+        effective_jobs,
+        args.max_samples,
+        bool(args.overwrite),
+    )
+
+    shard_results: Dict[str, Tuple[List[Dict], int]] = {}
+    if effective_jobs == 1:
+        for shard_idx, shard_name in enumerate(filenames, start=1):
+            remaining = None
+            if args.max_samples is not None:
+                remaining = max(int(args.max_samples) - sum(len(x[0]) for x in shard_results.values()), 0)
+                if remaining <= 0:
+                    LOGGER.info("Reached max_samples=%d before starting shard %s", args.max_samples, shard_name)
+                    break
+            _, shard_rows, shard_seen = _process_shard(
+                repo_id=args.repo_id,
+                shard_name=shard_name,
+                images_dir=images_dir,
+                dataset_name=args.dataset_name,
+                token=args.hf_token,
+                timeout=args.timeout,
+                overwrite=args.overwrite,
+                log_every=int(args.log_every),
+                max_samples=remaining,
+            )
+            shard_results[shard_name] = (shard_rows, shard_seen)
+            LOGGER.info(
+                "Collected shard %s (%d/%d): seen_pairs=%d buffered_rows=%d",
+                shard_name,
+                shard_idx,
+                len(filenames),
+                shard_seen,
+                len(shard_rows),
+            )
+            if args.max_samples is not None:
+                current_rows = sum(len(x[0]) for x in shard_results.values())
+                if current_rows >= args.max_samples:
+                    LOGGER.info("Reached max_samples=%d while reading shards", args.max_samples)
+                    break
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_jobs) as executor:
+            future_to_shard = {
+                executor.submit(
+                    _process_shard,
+                    args.repo_id,
+                    shard_name,
+                    images_dir,
+                    args.dataset_name,
+                    args.hf_token,
+                    args.timeout,
+                    args.overwrite,
+                    int(args.log_every),
+                ): shard_name
+                for shard_name in filenames
+            }
+            for completed_idx, future in enumerate(concurrent.futures.as_completed(future_to_shard), start=1):
+                shard_name, shard_rows, shard_seen = future.result()
+                shard_results[shard_name] = (shard_rows, shard_seen)
+                LOGGER.info(
+                    "Collected shard %s (%d/%d completed): seen_pairs=%d buffered_rows=%d",
+                    shard_name,
+                    completed_idx,
+                    len(filenames),
+                    shard_seen,
+                    len(shard_rows),
+                )
+
+    for shard_name in filenames:
+        if shard_name not in shard_results:
+            continue
+        shard_rows, shard_seen = shard_results[shard_name]
+        total_seen += shard_seen
+        for row in shard_rows:
+            row["sample_idx"] = sample_idx
+            rows.append(row)
+            total_written += 1
+            sample_idx += 1
+            if args.max_samples is not None and total_written >= args.max_samples:
+                _write_manifest(rows, output_csv)
+                summary = {
+                    "repo_id": args.repo_id,
+                    "filenames": filenames,
+                    "output_root": str(output_root),
+                    "output_csv": str(output_csv),
+                    "total_seen_pairs": total_seen,
+                    "total_written": total_written,
+                    "jobs": effective_jobs,
+                    "stopped_early": True,
+                }
+                output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+                LOGGER.info("Wrote manifest: %s", output_csv)
+                print(json.dumps(summary, indent=2))
+                return
+
+    _write_manifest(rows, output_csv)
+    summary = {
+        "repo_id": args.repo_id,
+        "filenames": filenames,
+        "output_root": str(output_root),
+        "output_csv": str(output_csv),
+        "total_seen_pairs": total_seen,
+        "total_written": total_written,
+        "jobs": effective_jobs,
+        "stopped_early": False,
+    }
+    output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    LOGGER.info("Wrote manifest: %s", output_csv)
+    print(json.dumps(summary, indent=2))
