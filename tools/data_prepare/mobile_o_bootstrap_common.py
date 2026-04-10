@@ -24,6 +24,31 @@ LOGGER = logging.getLogger(__name__)
 
 IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "bmp"}
 TEXT_EXTS = {"txt", "text", "caption"}
+MANIFEST_FIELDNAMES = [
+    "sample_idx",
+    "dataset",
+    "modality",
+    "caption",
+    "image_path",
+    "media_path",
+    "video_path",
+    "source_id",
+    "source_url",
+    "width",
+    "height",
+    "extra_json",
+]
+SHARD_FIELDNAMES = [x for x in MANIFEST_FIELDNAMES if x != "sample_idx"]
+FAILURE_FIELDNAMES = [
+    "dataset",
+    "shard",
+    "key",
+    "member_name",
+    "image_ext",
+    "caption_sha1",
+    "source_url",
+    "reason",
+]
 
 
 def _configure_logging() -> None:
@@ -202,6 +227,16 @@ def _source_id(shard_name: str, key: str) -> str:
     return f"{Path(shard_name).stem}:{key}"
 
 
+def _shard_cache_paths(output_csv: Path, shard_name: str) -> Dict[str, Path]:
+    shard_cache_dir = output_csv.parent / f"{output_csv.stem}_shards"
+    safe_name = shard_name.replace("/", "__").replace("\\", "__")
+    return {
+        "rows_csv": shard_cache_dir / f"{safe_name}.csv",
+        "summary_json": shard_cache_dir / f"{safe_name}.summary.json",
+        "failures_csv": shard_cache_dir / f"{safe_name}.failures.csv",
+    }
+
+
 def _existing_image_size(out_path: Path) -> Tuple[int, int]:
     with Image.open(out_path) as im:
         return im.size
@@ -334,22 +369,8 @@ def _process_shard(
     return shard_name, shard_rows, total_seen, failure_rows
 
 
-def _write_manifest(rows: List[Dict], output_csv: Path) -> None:
+def _write_csv_rows(rows: List[Dict], output_csv: Path, fieldnames: List[str]) -> None:
     output_csv.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "sample_idx",
-        "dataset",
-        "modality",
-        "caption",
-        "image_path",
-        "media_path",
-        "video_path",
-        "source_id",
-        "source_url",
-        "width",
-        "height",
-        "extra_json",
-    ]
     with output_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -357,26 +378,146 @@ def _write_manifest(rows: List[Dict], output_csv: Path) -> None:
             writer.writerow(row)
 
 
+def _write_shard_cache(
+    output_csv: Path,
+    shard_name: str,
+    shard_rows: List[Dict],
+    shard_seen: int,
+    shard_failures: List[Dict],
+) -> Dict:
+    cache_paths = _shard_cache_paths(output_csv, shard_name)
+    rows_csv = cache_paths["rows_csv"]
+    summary_json = cache_paths["summary_json"]
+    failures_csv = cache_paths["failures_csv"]
+
+    _write_csv_rows(shard_rows, rows_csv, SHARD_FIELDNAMES)
+    if shard_failures:
+        _write_csv_rows(shard_failures, failures_csv, FAILURE_FIELDNAMES)
+    elif failures_csv.exists():
+        failures_csv.unlink()
+
+    summary = {
+        "status": "finished",
+        "shard_name": shard_name,
+        "rows_csv": str(rows_csv),
+        "failures_csv": str(failures_csv) if shard_failures else None,
+        "seen_pairs": int(shard_seen),
+        "written_rows": int(len(shard_rows)),
+        "failed_rows": int(len(shard_failures)),
+    }
+    summary_json.parent.mkdir(parents=True, exist_ok=True)
+    summary_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return summary
+
+
 def _write_failures(failure_rows: List[Dict], output_csv: Path) -> Optional[Path]:
     if not failure_rows:
         return None
     fail_csv = output_csv.with_name(f"{output_csv.stem}_failures.csv")
-    fieldnames = [
-        "dataset",
-        "shard",
-        "key",
-        "member_name",
-        "image_ext",
-        "caption_sha1",
-        "source_url",
-        "reason",
-    ]
     with fail_csv.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=FAILURE_FIELDNAMES)
         writer.writeheader()
         for row in failure_rows:
             writer.writerow(row)
     return fail_csv
+
+
+def _load_shard_cache(output_csv: Path, shard_name: str) -> Optional[Dict]:
+    cache_paths = _shard_cache_paths(output_csv, shard_name)
+    summary_json = cache_paths["summary_json"]
+    rows_csv = cache_paths["rows_csv"]
+    if not summary_json.exists() or not rows_csv.exists():
+        return None
+
+    try:
+        summary = json.loads(summary_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Ignoring invalid shard cache summary %s (%s)", summary_json, exc)
+        return None
+
+    if summary.get("status") != "finished":
+        return None
+    if str(summary.get("shard_name", "")) != str(shard_name):
+        LOGGER.warning("Ignoring mismatched shard cache summary %s", summary_json)
+        return None
+    if not Path(str(summary.get("rows_csv", rows_csv))).exists():
+        return None
+    return summary
+
+
+def _append_failures_from_csv(fail_csv_path: Path, writer: csv.DictWriter) -> int:
+    count = 0
+    if not fail_csv_path.exists():
+        return count
+    with fail_csv_path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            writer.writerow({key: row.get(key, "") for key in FAILURE_FIELDNAMES})
+            count += 1
+    return count
+
+
+def _assemble_outputs(
+    *,
+    output_csv: Path,
+    shard_names: List[str],
+    shard_summaries: Dict[str, Dict],
+    start_sample_idx: int,
+    max_samples: Optional[int],
+) -> Dict:
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    total_written = 0
+    total_seen = 0
+    total_failed = 0
+    sample_idx = int(start_sample_idx)
+    stopped_early = False
+
+    with output_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDNAMES)
+        writer.writeheader()
+        for shard_name in shard_names:
+            summary = shard_summaries[shard_name]
+            total_seen += int(summary.get("seen_pairs", 0))
+            total_failed += int(summary.get("failed_rows", 0))
+            rows_csv = Path(str(summary["rows_csv"]))
+            with rows_csv.open("r", newline="", encoding="utf-8") as shard_f:
+                reader = csv.DictReader(shard_f)
+                for row in reader:
+                    out_row = {key: row.get(key, "") for key in SHARD_FIELDNAMES}
+                    out_row["sample_idx"] = sample_idx
+                    writer.writerow({"sample_idx": out_row["sample_idx"], **{k: out_row[k] for k in SHARD_FIELDNAMES}})
+                    sample_idx += 1
+                    total_written += 1
+                    if max_samples is not None and total_written >= max_samples:
+                        stopped_early = True
+                        break
+            if stopped_early:
+                break
+
+    fail_csv = output_csv.with_name(f"{output_csv.stem}_failures.csv")
+    failure_count_written = 0
+    with fail_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FAILURE_FIELDNAMES)
+        writer.writeheader()
+        for shard_name in shard_names:
+            summary = shard_summaries[shard_name]
+            fail_path = summary.get("failures_csv")
+            if not fail_path:
+                continue
+            failure_count_written += _append_failures_from_csv(Path(str(fail_path)), writer)
+    if failure_count_written == 0:
+        fail_csv.unlink()
+        fail_csv_out: Optional[Path] = None
+    else:
+        fail_csv_out = fail_csv
+
+    return {
+        "total_seen_pairs": total_seen,
+        "total_written": total_written,
+        "total_failed": total_failed,
+        "failed_csv": str(fail_csv_out) if fail_csv_out is not None else None,
+        "stopped_early": stopped_early,
+    }
 
 
 def run_bootstrap(
@@ -404,12 +545,14 @@ def run_bootstrap(
 
     filenames = _resolve_filenames(args.repo_id, args.filenames, input_root)
     sample_idx = int(args.start_sample_idx)
-    total_seen = 0
-    total_written = 0
-    rows: List[Dict] = []
-    failure_rows: List[Dict] = []
     source_mode = "local" if input_root is not None else "hf"
     source_desc = str(input_root) if input_root is not None else args.repo_id
+    reused_shards = 0
+    processed_shards = 0
+    selected_filenames: List[str] = []
+    shard_summaries: Dict[str, Dict] = {}
+    pending_filenames: List[str] = []
+    planned_written_rows = 0
 
     effective_jobs = max(1, int(args.jobs))
     if args.max_samples is not None and effective_jobs > 1:
@@ -431,15 +574,31 @@ def run_bootstrap(
         bool(args.overwrite),
     )
 
-    shard_results: Dict[str, Tuple[List[Dict], int, List[Dict]]] = {}
     if effective_jobs == 1:
         for shard_idx, shard_name in enumerate(filenames, start=1):
-            remaining = None
-            if args.max_samples is not None:
-                remaining = max(int(args.max_samples) - sum(len(x[0]) for x in shard_results.values()), 0)
-                if remaining <= 0:
-                    LOGGER.info("Reached max_samples=%d before starting shard %s", args.max_samples, shard_name)
+            if args.max_samples is not None and planned_written_rows >= int(args.max_samples):
+                LOGGER.info("Reached max_samples=%d before starting shard %s", args.max_samples, shard_name)
+                break
+
+            cached_summary = None if args.overwrite else _load_shard_cache(output_csv, shard_name)
+            if cached_summary is not None:
+                shard_summaries[shard_name] = cached_summary
+                selected_filenames.append(shard_name)
+                reused_shards += 1
+                planned_written_rows += int(cached_summary.get("written_rows", 0))
+                LOGGER.info(
+                    "Reusing cached shard %s (%d/%d): written_rows=%d failed_rows=%d",
+                    shard_name,
+                    shard_idx,
+                    len(filenames),
+                    int(cached_summary.get("written_rows", 0)),
+                    int(cached_summary.get("failed_rows", 0)),
+                )
+                if args.max_samples is not None and planned_written_rows >= int(args.max_samples):
+                    LOGGER.info("Reached max_samples=%d while reading cached shards", args.max_samples)
                     break
+                continue
+
             _, shard_rows, shard_seen, shard_failures = _process_shard(
                 repo_id=args.repo_id,
                 input_root=input_root,
@@ -450,9 +609,19 @@ def run_bootstrap(
                 timeout=args.timeout,
                 overwrite=args.overwrite,
                 log_every=int(args.log_every),
-                max_samples=remaining,
+                max_samples=None,
             )
-            shard_results[shard_name] = (shard_rows, shard_seen, shard_failures)
+            shard_summary = _write_shard_cache(
+                output_csv=output_csv,
+                shard_name=shard_name,
+                shard_rows=shard_rows,
+                shard_seen=shard_seen,
+                shard_failures=shard_failures,
+            )
+            shard_summaries[shard_name] = shard_summary
+            selected_filenames.append(shard_name)
+            processed_shards += 1
+            planned_written_rows += int(shard_summary.get("written_rows", 0))
             LOGGER.info(
                 "Collected shard %s (%d/%d): seen_pairs=%d buffered_rows=%d failed_rows=%d",
                 shard_name,
@@ -462,12 +631,25 @@ def run_bootstrap(
                 len(shard_rows),
                 len(shard_failures),
             )
-            if args.max_samples is not None:
-                current_rows = sum(len(x[0]) for x in shard_results.values())
-                if current_rows >= args.max_samples:
-                    LOGGER.info("Reached max_samples=%d while reading shards", args.max_samples)
-                    break
+            if args.max_samples is not None and planned_written_rows >= int(args.max_samples):
+                LOGGER.info("Reached max_samples=%d while reading shards", args.max_samples)
+                break
     else:
+        for shard_name in filenames:
+            cached_summary = None if args.overwrite else _load_shard_cache(output_csv, shard_name)
+            if cached_summary is not None:
+                shard_summaries[shard_name] = cached_summary
+                selected_filenames.append(shard_name)
+                reused_shards += 1
+                LOGGER.info(
+                    "Reusing cached shard %s: written_rows=%d failed_rows=%d",
+                    shard_name,
+                    int(cached_summary.get("written_rows", 0)),
+                    int(cached_summary.get("failed_rows", 0)),
+                )
+            else:
+                pending_filenames.append(shard_name)
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=effective_jobs) as executor:
             future_to_shard = {
                 executor.submit(
@@ -482,74 +664,56 @@ def run_bootstrap(
                     args.overwrite,
                     int(args.log_every),
                 ): shard_name
-                for shard_name in filenames
+                for shard_name in pending_filenames
             }
             for completed_idx, future in enumerate(concurrent.futures.as_completed(future_to_shard), start=1):
                 shard_name, shard_rows, shard_seen, shard_failures = future.result()
-                shard_results[shard_name] = (shard_rows, shard_seen, shard_failures)
+                shard_summary = _write_shard_cache(
+                    output_csv=output_csv,
+                    shard_name=shard_name,
+                    shard_rows=shard_rows,
+                    shard_seen=shard_seen,
+                    shard_failures=shard_failures,
+                )
+                shard_summaries[shard_name] = shard_summary
+                selected_filenames.append(shard_name)
+                processed_shards += 1
                 LOGGER.info(
                     "Collected shard %s (%d/%d completed): seen_pairs=%d buffered_rows=%d failed_rows=%d",
                     shard_name,
                     completed_idx,
-                    len(filenames),
+                    len(pending_filenames),
                     shard_seen,
                     len(shard_rows),
                     len(shard_failures),
                 )
 
-    for shard_name in filenames:
-        if shard_name not in shard_results:
-            continue
-        shard_rows, shard_seen, shard_failures = shard_results[shard_name]
-        total_seen += shard_seen
-        failure_rows.extend(shard_failures)
-        for row in shard_rows:
-            row["sample_idx"] = sample_idx
-            rows.append(row)
-            total_written += 1
-            sample_idx += 1
-            if args.max_samples is not None and total_written >= args.max_samples:
-                _write_manifest(rows, output_csv)
-                fail_csv = _write_failures(failure_rows, output_csv)
-                summary = {
-                    "source_mode": source_mode,
-                    "input_root": str(input_root) if input_root is not None else None,
-                    "repo_id": args.repo_id,
-                    "filenames": filenames,
-                    "output_root": str(output_root),
-                    "output_csv": str(output_csv),
-                    "total_seen_pairs": total_seen,
-                    "total_written": total_written,
-                    "total_failed": len(failure_rows),
-                    "failed_csv": str(fail_csv) if fail_csv is not None else None,
-                    "jobs": effective_jobs,
-                    "stopped_early": True,
-                }
-                output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-                LOGGER.info("Wrote manifest: %s", output_csv)
-                if fail_csv is not None:
-                    LOGGER.warning("Wrote bootstrap failures CSV: %s", fail_csv)
-                print(json.dumps(summary, indent=2))
-                return
-
-    _write_manifest(rows, output_csv)
-    fail_csv = _write_failures(failure_rows, output_csv)
+    ordered_selected = [shard_name for shard_name in filenames if shard_name in shard_summaries and shard_name in set(selected_filenames)]
+    assembly = _assemble_outputs(
+        output_csv=output_csv,
+        shard_names=ordered_selected,
+        shard_summaries=shard_summaries,
+        start_sample_idx=sample_idx,
+        max_samples=args.max_samples,
+    )
     summary = {
         "source_mode": source_mode,
         "input_root": str(input_root) if input_root is not None else None,
         "repo_id": args.repo_id,
-        "filenames": filenames,
+        "filenames": ordered_selected,
         "output_root": str(output_root),
         "output_csv": str(output_csv),
-        "total_seen_pairs": total_seen,
-        "total_written": total_written,
-        "total_failed": len(failure_rows),
-        "failed_csv": str(fail_csv) if fail_csv is not None else None,
+        "total_seen_pairs": assembly["total_seen_pairs"],
+        "total_written": assembly["total_written"],
+        "total_failed": assembly["total_failed"],
+        "failed_csv": assembly["failed_csv"],
         "jobs": effective_jobs,
-        "stopped_early": False,
+        "stopped_early": assembly["stopped_early"],
+        "reused_shards": reused_shards,
+        "processed_shards": processed_shards,
     }
     output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     LOGGER.info("Wrote manifest: %s", output_csv)
-    if fail_csv is not None:
-        LOGGER.warning("Wrote bootstrap failures CSV: %s", fail_csv)
+    if assembly["failed_csv"] is not None:
+        LOGGER.warning("Wrote bootstrap failures CSV: %s", assembly["failed_csv"])
     print(json.dumps(summary, indent=2))

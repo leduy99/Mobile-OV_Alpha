@@ -52,6 +52,9 @@ The final train-ready CSV is what the existing image-training configs should use
 If you keep the default output location, the ready-made `ver 1` and `ver 2`
 training configs will point at it automatically.
 
+Bootstrap now also writes a per-shard cache under `manifests/*_shards/`, so
+reruns can resume by shard instead of re-reading every tar from scratch.
+
 ## 2. Environment
 
 Use the verified env flow:
@@ -145,6 +148,9 @@ data/blip3o_pretrain_journeydb/
   manifests/blip3o_pretrain_journeydb_source.csv
   manifests/blip3o_pretrain_journeydb_source_failures.csv
   manifests/blip3o_pretrain_journeydb_source.summary.json
+  manifests/blip3o_pretrain_journeydb_source_shards/
+    JourneyDB_215.tar.csv
+    JourneyDB_215.tar.summary.json
   encoded/wan_vae_sana_ar/sample_00000000.pkl
   encoded/wan_vae_sana_ar/summary_rank00.json
   manifests/blip3o_pretrain_journeydb_train_ready.csv
@@ -154,6 +160,7 @@ data/blip3o_pretrain_journeydb/
 ## 7. Resume behavior
 
 - bootstrap will reuse existing materialized image files unless `--overwrite` is set
+- bootstrap will reuse completed shard caches on rerun, so already finished tar shards are skipped
 - corrupt or unreadable image payloads are skipped and recorded in `*_source_failures.csv`
 - encoding will skip existing `sample_XXXXXXXX.pkl` files
 - rebuilding the train-ready manifest is always safe
