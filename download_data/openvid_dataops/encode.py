@@ -472,7 +472,11 @@ def encode_manifest(
     LOGGER.info("Rank %d summary saved: %s", rank, summary_path)
 
     if world_size > 1 and dist.is_initialized():
-        dist.barrier(device_ids=[local_rank])
-        if rank == 0:
-            LOGGER.info("All ranks finished WAN VAE encoding")
+        # This encode path is shard-independent and each rank already persists its
+        # own outputs plus a finished summary above. A final NCCL barrier makes
+        # resume-heavy runs fragile because ranks that mostly skip existing files
+        # can reach the end minutes earlier than straggler ranks that still
+        # encode new samples. In practice that leads to TCPStore/NCCL timeouts
+        # near job completion even though the encoded outputs are already valid.
+        LOGGER.info("Rank %d destroying process group without final barrier", rank)
         dist.destroy_process_group()
