@@ -202,6 +202,11 @@ def _source_id(shard_name: str, key: str) -> str:
     return f"{Path(shard_name).stem}:{key}"
 
 
+def _existing_image_size(out_path: Path) -> Tuple[int, int]:
+    with Image.open(out_path) as im:
+        return im.size
+
+
 def _process_shard(
     repo_id: str,
     input_root: Optional[Path],
@@ -213,7 +218,7 @@ def _process_shard(
     overwrite: bool,
     log_every: int,
     max_samples: Optional[int] = None,
-) -> Tuple[str, List[Dict], int]:
+) -> Tuple[str, List[Dict], int, List[Dict]]:
     source_mode = "hf"
     source_ref = ""
     pair_iter: Iterator[Tuple[str, Dict]]
@@ -228,6 +233,7 @@ def _process_shard(
         source_ref = hf_hub_url(repo_id, shard_name, repo_type="dataset")
         pair_iter = _iter_wds_pairs_from_url(source_ref, token=token, timeout=timeout)
     shard_rows: List[Dict] = []
+    failure_rows: List[Dict] = []
     total_seen = 0
     shard_stem = Path(shard_name).stem
 
@@ -241,15 +247,40 @@ def _process_shard(
 
         ext = str(record.get("image_ext", "jpg")).lower()
         out_path = images_dir / shard_stem / f"{key}.{ext}"
-        if out_path.exists() and not overwrite:
-            width = height = -1
-            try:
-                with Image.open(out_path) as im:
-                    width, height = im.size
-            except Exception:
-                pass
-        else:
-            width, height = _save_image(record["image_bytes"], ext, out_path)
+        try:
+            if out_path.exists() and not overwrite:
+                try:
+                    width, height = _existing_image_size(out_path)
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Shard %s key=%s existing image is unreadable; rewriting from tar payload (%s)",
+                        shard_name,
+                        key,
+                        exc,
+                    )
+                    width, height = _save_image(record["image_bytes"], ext, out_path)
+            else:
+                width, height = _save_image(record["image_bytes"], ext, out_path)
+        except Exception as exc:
+            failure_rows.append(
+                {
+                    "dataset": dataset_name,
+                    "shard": shard_name,
+                    "key": key,
+                    "member_name": record.get("member_name", ""),
+                    "image_ext": ext,
+                    "caption_sha1": hashlib.sha1(caption.encode("utf-8")).hexdigest(),
+                    "source_url": source_ref,
+                    "reason": str(exc),
+                }
+            )
+            LOGGER.warning(
+                "Shard %s key=%s skipped due to image decode/save error: %s",
+                shard_name,
+                key,
+                exc,
+            )
+            continue
 
         shard_rows.append(
             {
@@ -294,12 +325,13 @@ def _process_shard(
             break
 
     LOGGER.info(
-        "Finished shard %s: seen_pairs=%d written_rows=%d",
+        "Finished shard %s: seen_pairs=%d written_rows=%d failed_rows=%d",
         shard_name,
         total_seen,
         len(shard_rows),
+        len(failure_rows),
     )
-    return shard_name, shard_rows, total_seen
+    return shard_name, shard_rows, total_seen, failure_rows
 
 
 def _write_manifest(rows: List[Dict], output_csv: Path) -> None:
@@ -323,6 +355,28 @@ def _write_manifest(rows: List[Dict], output_csv: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+
+
+def _write_failures(failure_rows: List[Dict], output_csv: Path) -> Optional[Path]:
+    if not failure_rows:
+        return None
+    fail_csv = output_csv.with_name(f"{output_csv.stem}_failures.csv")
+    fieldnames = [
+        "dataset",
+        "shard",
+        "key",
+        "member_name",
+        "image_ext",
+        "caption_sha1",
+        "source_url",
+        "reason",
+    ]
+    with fail_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in failure_rows:
+            writer.writerow(row)
+    return fail_csv
 
 
 def run_bootstrap(
@@ -353,6 +407,7 @@ def run_bootstrap(
     total_seen = 0
     total_written = 0
     rows: List[Dict] = []
+    failure_rows: List[Dict] = []
     source_mode = "local" if input_root is not None else "hf"
     source_desc = str(input_root) if input_root is not None else args.repo_id
 
@@ -376,7 +431,7 @@ def run_bootstrap(
         bool(args.overwrite),
     )
 
-    shard_results: Dict[str, Tuple[List[Dict], int]] = {}
+    shard_results: Dict[str, Tuple[List[Dict], int, List[Dict]]] = {}
     if effective_jobs == 1:
         for shard_idx, shard_name in enumerate(filenames, start=1):
             remaining = None
@@ -385,7 +440,7 @@ def run_bootstrap(
                 if remaining <= 0:
                     LOGGER.info("Reached max_samples=%d before starting shard %s", args.max_samples, shard_name)
                     break
-            _, shard_rows, shard_seen = _process_shard(
+            _, shard_rows, shard_seen, shard_failures = _process_shard(
                 repo_id=args.repo_id,
                 input_root=input_root,
                 shard_name=shard_name,
@@ -397,14 +452,15 @@ def run_bootstrap(
                 log_every=int(args.log_every),
                 max_samples=remaining,
             )
-            shard_results[shard_name] = (shard_rows, shard_seen)
+            shard_results[shard_name] = (shard_rows, shard_seen, shard_failures)
             LOGGER.info(
-                "Collected shard %s (%d/%d): seen_pairs=%d buffered_rows=%d",
+                "Collected shard %s (%d/%d): seen_pairs=%d buffered_rows=%d failed_rows=%d",
                 shard_name,
                 shard_idx,
                 len(filenames),
                 shard_seen,
                 len(shard_rows),
+                len(shard_failures),
             )
             if args.max_samples is not None:
                 current_rows = sum(len(x[0]) for x in shard_results.values())
@@ -429,22 +485,24 @@ def run_bootstrap(
                 for shard_name in filenames
             }
             for completed_idx, future in enumerate(concurrent.futures.as_completed(future_to_shard), start=1):
-                shard_name, shard_rows, shard_seen = future.result()
-                shard_results[shard_name] = (shard_rows, shard_seen)
+                shard_name, shard_rows, shard_seen, shard_failures = future.result()
+                shard_results[shard_name] = (shard_rows, shard_seen, shard_failures)
                 LOGGER.info(
-                    "Collected shard %s (%d/%d completed): seen_pairs=%d buffered_rows=%d",
+                    "Collected shard %s (%d/%d completed): seen_pairs=%d buffered_rows=%d failed_rows=%d",
                     shard_name,
                     completed_idx,
                     len(filenames),
                     shard_seen,
                     len(shard_rows),
+                    len(shard_failures),
                 )
 
     for shard_name in filenames:
         if shard_name not in shard_results:
             continue
-        shard_rows, shard_seen = shard_results[shard_name]
+        shard_rows, shard_seen, shard_failures = shard_results[shard_name]
         total_seen += shard_seen
+        failure_rows.extend(shard_failures)
         for row in shard_rows:
             row["sample_idx"] = sample_idx
             rows.append(row)
@@ -452,6 +510,7 @@ def run_bootstrap(
             sample_idx += 1
             if args.max_samples is not None and total_written >= args.max_samples:
                 _write_manifest(rows, output_csv)
+                fail_csv = _write_failures(failure_rows, output_csv)
                 summary = {
                     "source_mode": source_mode,
                     "input_root": str(input_root) if input_root is not None else None,
@@ -461,15 +520,20 @@ def run_bootstrap(
                     "output_csv": str(output_csv),
                     "total_seen_pairs": total_seen,
                     "total_written": total_written,
+                    "total_failed": len(failure_rows),
+                    "failed_csv": str(fail_csv) if fail_csv is not None else None,
                     "jobs": effective_jobs,
                     "stopped_early": True,
                 }
                 output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
                 LOGGER.info("Wrote manifest: %s", output_csv)
+                if fail_csv is not None:
+                    LOGGER.warning("Wrote bootstrap failures CSV: %s", fail_csv)
                 print(json.dumps(summary, indent=2))
                 return
 
     _write_manifest(rows, output_csv)
+    fail_csv = _write_failures(failure_rows, output_csv)
     summary = {
         "source_mode": source_mode,
         "input_root": str(input_root) if input_root is not None else None,
@@ -479,9 +543,13 @@ def run_bootstrap(
         "output_csv": str(output_csv),
         "total_seen_pairs": total_seen,
         "total_written": total_written,
+        "total_failed": len(failure_rows),
+        "failed_csv": str(fail_csv) if fail_csv is not None else None,
         "jobs": effective_jobs,
         "stopped_early": False,
     }
     output_csv.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     LOGGER.info("Wrote manifest: %s", output_csv)
+    if fail_csv is not None:
+        LOGGER.warning("Wrote bootstrap failures CSV: %s", fail_csv)
     print(json.dumps(summary, indent=2))

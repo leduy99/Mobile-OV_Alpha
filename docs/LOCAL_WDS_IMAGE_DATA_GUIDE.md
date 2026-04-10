@@ -131,6 +131,7 @@ You will now see progress in the terminal while the pipeline runs:
 - shard discovery logs
 - shard start and finish logs
 - periodic bootstrap progress logs inside each shard
+- corrupt-image skip warnings when a bad tar sample is encountered
 - encoder progress logs per rank
 - manifest write summaries
 
@@ -142,6 +143,7 @@ Example output structure:
 data/blip3o_pretrain_journeydb/
   raw/images/JourneyDB_215/02150000.jpg
   manifests/blip3o_pretrain_journeydb_source.csv
+  manifests/blip3o_pretrain_journeydb_source_failures.csv
   manifests/blip3o_pretrain_journeydb_source.summary.json
   encoded/wan_vae_sana_ar/sample_00000000.pkl
   encoded/wan_vae_sana_ar/summary_rank00.json
@@ -152,6 +154,7 @@ data/blip3o_pretrain_journeydb/
 ## 7. Resume behavior
 
 - bootstrap will reuse existing materialized image files unless `--overwrite` is set
+- corrupt or unreadable image payloads are skipped and recorded in `*_source_failures.csv`
 - encoding will skip existing `sample_XXXXXXXX.pkl` files
 - rebuilding the train-ready manifest is always safe
 
