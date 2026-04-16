@@ -243,3 +243,35 @@ data/blip3o_pretrain_journeydb/manifests/blip3o_pretrain_journeydb_train_ready.c
 ```
 
 The rest of the image-only settings can stay as they are.
+
+## 12. Train a merged JourneyDB + Short-Caption manifest
+
+If you already have two clean train-ready manifests and merge them into a single CSV, you do not need to merge the latent folders. Keep each row's `preprocessed_path` pointing to the correct `.pkl` file in its original dataset directory.
+
+Example merged manifest:
+
+```text
+data/full_mobile-o/manifests/journeydb_short_caption_train_ready.csv
+```
+
+Ready-to-run merged-data launchers:
+
+- `ver 1`: [train_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh)
+- `ver 2`: [train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh)
+
+Those launchers use these configs:
+
+- [stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml)
+- [stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml)
+
+Run `ver 1`:
+
+```bash
+bash scripts/train_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh
+```
+
+Run `ver 2`:
+
+```bash
+bash scripts/train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh
+```
