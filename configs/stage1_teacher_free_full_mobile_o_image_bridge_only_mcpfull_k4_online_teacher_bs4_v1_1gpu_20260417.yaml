@@ -1,6 +1,6 @@
 run:
   seed: 1234
-  output_dir: output/stage1_bridge_only_full_mobile_o_smolvlm2_500m_mcpfull_k4_online_teacher_bs4_v1_20260417_1gpu
+  output_dir: output/stage1_bridge_only_full_mobile_o_smolvlm2_500m_mcpfull_k4_online_teacher_bs64_v1_20260417_8gpu
   log_every: 10
   save_every_steps: 5000
   num_workers: 0
@@ -154,8 +154,8 @@ data:
   - 'A short video clip of {prompt}. motion score: {motion_score}.'
   - 'A cinematic video of {prompt}. motion score: {motion_score}.'
   batching:
-    batch_size: 4
-    batch_size_image: 4
+    batch_size: 64
+    batch_size_image: 64
     grad_accum_steps: 1
     shuffle: true
     drop_last: false

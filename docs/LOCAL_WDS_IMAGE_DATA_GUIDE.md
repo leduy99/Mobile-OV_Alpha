@@ -264,6 +264,14 @@ Those launchers use these configs:
 - [stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml)
 - [stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml)
 
+Default merged-data training settings in those launchers:
+
+- GPUs: `8`
+- `CUDA_VISIBLE_DEVICES`: `0,1,2,3,4,5,6,7`
+- `batch_size`: `64`
+- `batch_size_image`: `64`
+- `grad_accum_steps`: `1`
+
 Run `ver 1`:
 
 ```bash
@@ -275,3 +283,46 @@ Run `ver 2`:
 ```bash
 bash scripts/train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh
 ```
+
+## 13. Change GPU count or batch size
+
+To change the number of GPUs, edit both launcher scripts:
+
+- [train_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1.sh)
+- [train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/scripts/train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh)
+
+Update these two places together:
+
+- `CUDA_VISIBLE_DEVICES`
+- `--max-gpus`
+
+Example for `4` GPUs:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+...
+--max-gpus 4
+```
+
+To change batch size, edit the config you use:
+
+- [stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_mcpfull_k4_online_teacher_bs4_v1_1gpu_20260417.yaml)
+- [stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml](/share_4/users/duy/project/unified_video/Omni-Video-smolvlm2/configs/stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml)
+
+Update these fields:
+
+- `data.batching.batch_size`
+- `data.batching.batch_size_image`
+- optionally `data.batching.grad_accum_steps`
+
+Example:
+
+```yaml
+data:
+  batching:
+    batch_size: 32
+    batch_size_image: 32
+    grad_accum_steps: 2
+```
+
+If you want a smaller effective batch without lowering throughput too much, keep the per-step batch modest and increase `grad_accum_steps`.
