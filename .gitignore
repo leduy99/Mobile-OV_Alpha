@@ -18,6 +18,8 @@ output/
 
 # Datasets and downloaded media
 data/
+!nets/third_party/sana/diffusion/data/
+!nets/third_party/sana/diffusion/data/**
 data_stage1/
 download_data/data/*
 !download_data/data/.gitkeep
