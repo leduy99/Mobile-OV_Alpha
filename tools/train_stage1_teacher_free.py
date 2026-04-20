@@ -1212,13 +1212,22 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     precision = (args.precision or cfg.run.precision or "bf16").lower()
     dtype = torch.bfloat16 if precision in ("bf16", "bfloat16") else torch.float32
 
+    checkpoint_load_path = args.resume_from or getattr(args, "init_from", None)
+    checkpoint_load_mode = "resume" if args.resume_from else ("init" if getattr(args, "init_from", None) else None)
     output_dir = args.output_dir or cfg.run.output_dir
+    resume_run_dir = None
+    if args.resume_from:
+        resume_run_dir = args.output_dir or os.path.dirname(os.path.abspath(args.resume_from))
+
     if is_main:
         os.makedirs(output_dir, exist_ok=True)
-        run_dir = os.path.join(output_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
+        if resume_run_dir is not None:
+            run_dir = resume_run_dir
+        else:
+            run_dir = os.path.join(output_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
         os.makedirs(run_dir, exist_ok=True)
     else:
-        run_dir = output_dir
+        run_dir = resume_run_dir or output_dir
 
     sana_cfg: SanaVideoConfig = load_sana_config(cfg.sana.config)
     sana_ckpt_dir = cfg.sana.dit_ckpt or cfg.sana.get("ckpt_dir", "omni_ckpts/sana_video_2b_480p")
@@ -1280,8 +1289,6 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     strict_sana_tail_tokens = int(getattr(cfg.run, "strict_sana_tail_tokens", 96) or 96)
     strict_fail_fast_mask = bool(getattr(cfg.run, "strict_fail_fast_mask", strict_sana_parity_text_path))
     sana_model_max_length = int(getattr(getattr(sana_cfg, "text_encoder", AttrDict()), "model_max_length", 300) or 300)
-    checkpoint_load_path = args.resume_from or getattr(args, "init_from", None)
-    checkpoint_load_mode = "resume" if args.resume_from else ("init" if getattr(args, "init_from", None) else None)
     load_log_prefix = "Resume" if checkpoint_load_mode == "resume" else "Init"
     resume_ckpt = None
     resume_student_state = None
@@ -2028,6 +2035,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     batch_size = args.batch_size or cfg.data.batching.batch_size
     log_every = args.log_every or cfg.run.log_every
     save_every = args.save_every or cfg.run.save_every_steps
+    latest_save_every = args.latest_save_every or int(getattr(cfg.run, "latest_save_every_steps", 0) or 0)
     total_steps = args.total_steps or cfg.train.total_steps
     sync_debug_every_cfg = getattr(cfg.run, "sync_debug_log_every_params", 0)
     sync_debug_every = int(0 if sync_debug_every_cfg is None else sync_debug_every_cfg)
@@ -3891,49 +3899,15 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 if was_training:
                     student_module.train()
 
-        if is_sync_step and save_every and update_step % save_every == 0:
+        should_save_step = bool(is_sync_step and save_every and update_step % save_every == 0)
+        should_save_latest = bool(is_sync_step and latest_save_every and update_step % latest_save_every == 0)
+        if should_save_step or should_save_latest:
             # Save trainable student + trainable DiT slices for fast resume/infer iteration.
-            ckpt_path = os.path.join(run_dir, f"checkpoint_step{update_step}.pt")
             student_state = build_student_checkpoint_state(student, student_module)
             dit_state = get_trainable_dit_state_dict(diffusion_model)
-            if is_main:
-                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-                torch.save(
-                    {
-                        "step": update_step,
-                        "micro_step": micro_step + 1,
-                        "student_state": student_state,
-                        "dit_trainable_state": dit_state,
-                        "optimizer": (
-                            optimizer.state_dict()
-                            if optimizer is not None
-                            else (bridge_optimizer.state_dict() if bridge_optimizer is not None else {})
-                        ),
-                        "scheduler": (
-                            scheduler.state_dict()
-                            if scheduler is not None
-                            else (bridge_scheduler.state_dict() if bridge_scheduler is not None else {})
-                        ),
-                        "dit_train_modules": list(dit_train_modules),
-                        "infer_hints": infer_hints,
-                    },
-                    ckpt_path,
-                )
-                logger.info("Saved checkpoint: %s", ckpt_path)
-            if use_barrier:
-                safe_barrier(local_rank)
-
-        micro_step += 1
-
-    student_state = build_student_checkpoint_state(student, student_module)
-    dit_state = get_trainable_dit_state_dict(diffusion_model)
-    if is_main and (not probe_only):
-        final_ckpt_path = os.path.join(run_dir, "checkpoint_final.pt")
-        os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
-        torch.save(
-            {
+            ckpt_payload = {
                 "step": update_step,
-                "micro_step": micro_step,
+                "micro_step": micro_step + 1,
                 "student_state": student_state,
                 "dit_trainable_state": dit_state,
                 "optimizer": (
@@ -3948,10 +3922,55 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 ),
                 "dit_train_modules": list(dit_train_modules),
                 "infer_hints": infer_hints,
-            },
-            final_ckpt_path,
-        )
+            }
+            if is_main:
+                if should_save_step:
+                    ckpt_path = os.path.join(run_dir, f"checkpoint_step{update_step}.pt")
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                    torch.save(ckpt_payload, ckpt_path)
+                    logger.info("Saved checkpoint: %s", ckpt_path)
+                if should_save_latest:
+                    latest_ckpt_path = os.path.join(run_dir, "checkpoint_latest.pt")
+                    latest_tmp_path = latest_ckpt_path + ".tmp"
+                    os.makedirs(os.path.dirname(latest_ckpt_path), exist_ok=True)
+                    torch.save(ckpt_payload, latest_tmp_path)
+                    os.replace(latest_tmp_path, latest_ckpt_path)
+                    logger.info("Saved latest checkpoint: %s", latest_ckpt_path)
+            if use_barrier:
+                safe_barrier(local_rank)
+
+        micro_step += 1
+
+    student_state = build_student_checkpoint_state(student, student_module)
+    dit_state = get_trainable_dit_state_dict(diffusion_model)
+    if is_main and (not probe_only):
+        final_ckpt_path = os.path.join(run_dir, "checkpoint_final.pt")
+        latest_ckpt_path = os.path.join(run_dir, "checkpoint_latest.pt")
+        latest_tmp_path = latest_ckpt_path + ".tmp"
+        os.makedirs(os.path.dirname(final_ckpt_path), exist_ok=True)
+        final_payload = {
+            "step": update_step,
+            "micro_step": micro_step,
+            "student_state": student_state,
+            "dit_trainable_state": dit_state,
+            "optimizer": (
+                optimizer.state_dict()
+                if optimizer is not None
+                else (bridge_optimizer.state_dict() if bridge_optimizer is not None else {})
+            ),
+            "scheduler": (
+                scheduler.state_dict()
+                if scheduler is not None
+                else (bridge_scheduler.state_dict() if bridge_scheduler is not None else {})
+            ),
+            "dit_train_modules": list(dit_train_modules),
+            "infer_hints": infer_hints,
+        }
+        torch.save(final_payload, final_ckpt_path)
+        torch.save(final_payload, latest_tmp_path)
+        os.replace(latest_tmp_path, latest_ckpt_path)
         logger.info("Saved final checkpoint: %s", final_ckpt_path)
+        logger.info("Updated latest checkpoint: %s", latest_ckpt_path)
         os.makedirs(run_dir, exist_ok=True)
         with open(os.path.join(run_dir, "train_config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
@@ -3972,6 +3991,7 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=None)
+    parser.add_argument("--latest-save-every", type=int, default=None)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--precision", type=str, default=None)
