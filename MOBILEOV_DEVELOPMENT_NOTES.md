@@ -14,6 +14,105 @@ Tài liệu tổng hợp về quá trình phát triển MobileOV, các thay đ�
 9. [Smol Visual Recipe Repro (2026-03-25)](#smol-visual-recipe-repro-2026-03-25)
 10. [Experiment Report (2026-03-25)](#experiment-report-2026-03-25)
 11. [Overfit And Recaption Diagnostics (2026-03-25)](#overfit-and-recaption-diagnostics-2026-03-25)
+12. [Full Mobile-O Image Recipe Status (2026-04-20)](#full-mobile-o-image-recipe-status-2026-04-20)
+
+---
+
+## Full Mobile-O Image Recipe Status (2026-04-20)
+
+We now have one `full_mobile_o` image-only line that is important to preserve as
+a known-working recipe family.
+
+### What is now considered "confirmed working"
+
+The `bridge-only + online teacher distill` recipe for merged Mobile-O image data
+is no longer just a speculative setup. It ran stably enough to produce a usable
+`step10000` checkpoint and that checkpoint passed prompt-based image inference
+sanity checks.
+
+This does **not** mean the recipe is final or already optimal. It means the
+training path itself is valid and worth keeping as a baseline instead of
+discarding it as another dead branch.
+
+### Known-working bridge-only teacher recipe
+
+- Config:
+  `configs/stage1_teacher_free_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2_1gpu_20260417.yaml`
+- Launcher:
+  `scripts/train_full_mobile_o_image_bridge_only_lexical_gated_k2_online_teacher_bs4_v2.sh`
+- Data:
+  merged image-only manifest
+  `data/full_mobile-o/manifests/journeydb_short_caption_train_ready.csv`
+  built from `JourneyDB + Short-Caption`
+- Student family:
+  `SmolVLM2-500M`
+- Projector:
+  `mcp_lexical_gated`, `K=2`
+- DiT setting:
+  `train_modules: []` (bridge-only, no DiT finetuning)
+- Effective train batch:
+  `batch_size=64`, `batch_size_image=64`, `grad_accum_steps=1`
+- Hardware used for the real long run:
+  `8 x H200` on Berzelius
+
+Loss stack used by this known-working bridge-only run:
+- diffusion loss enabled with `diff.weight=1.0`
+- online teacher distill enabled
+- `freeze_sana_conditioner: true`
+- `online_fallback_on_missing: true`
+- token losses enabled:
+  `token_mse_weight=1.0`, `token_cos_weight=0.5`, `pooled_cos_weight=0.2`
+- teacher-side auxiliary alignment enabled:
+  `contrastive_weight=0.1`, `hidden0_geom_weight=0.05`
+- functional loss enabled:
+  `pred_mse_weight=0.05`, `pred_cos_weight=0.02`
+- disabled regularizers:
+  `semantic_probe`, `norm`, and `gate`
+
+Most important practical takeaway:
+- this recipe produced the bridge-only checkpoint
+  `output/stage1_bridge_only_full_mobile_o_smolvlm2_500m_lexical_gated_k2_online_teacher_bs64_v2_20260417_8gpu/20260417_093000/checkpoint_step10000.pt`
+- that `step10000` checkpoint was later used successfully for image inference
+  sanity checks and for initializing the next full-DiT run family
+
+### Follow-up full-DiT recipe that now branches from the 10k bridge checkpoint
+
+We also now have a clean continuation recipe that starts from the known-working
+bridge-only `10k` checkpoint and then trains both bridge + full DiT.
+
+- Config:
+  `configs/stage1_full_mobile_o_fulldit_diffonly_init10k_v2_bs64_8gpu.yaml`
+- Launcher:
+  `scripts/train_full_mobile_o_fulldit_diffonly_init10k_v2.sh`
+- Init checkpoint:
+  `output/stage1_bridge_only_full_mobile_o_smolvlm2_500m_lexical_gated_k2_online_teacher_bs64_v2_20260417_8gpu/20260417_093000/checkpoint_step10000.pt`
+- Student family:
+  `SmolVLM2-500M`
+- Projector:
+  `mcp_lexical_gated`, `K=2`
+- DiT setting:
+  `train_modules: [all]`
+- Sharding:
+  `model.dit.fsdp: true`
+- Effective train batch:
+  `batch_size=64`, `batch_size_image=64`, `grad_accum_steps=1`
+- Intended hardware:
+  `8 x H200`
+- Current default duration:
+  `total_steps=500000`
+
+Loss stack used by this follow-up run:
+- diffusion loss only
+- `distill.enabled: false`
+- `functional.enabled: false`
+- `semantic_probe`, `norm`, and `gate` all disabled
+
+### Small operational note
+
+In logs, this image-only merged-data run may still print `mode=video`. In this
+recipe that label is only a loader-path naming artifact; the actual manifest is
+image-only and the dataset contract is `expected_latent_t=1`,
+`expected_frame_num=1`.
 
 ---
 
