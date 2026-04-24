@@ -3,6 +3,7 @@ run:
   output_dir: output/stage1_bridge_fulldit_full_mobile_o_smolvlm2_500m_lexical_gated_k2_diffonly_init10k_bs64_v2_20260420_8gpu
   log_every: 10
   save_every_steps: 5000
+  save_latest_every_steps: 100
   num_workers: 0
   precision: bf16
   auto_download_pretrained: true

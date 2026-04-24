@@ -414,6 +414,15 @@ def compute_masked_token_cos(student: torch.Tensor, teacher: torch.Tensor, mask:
     return 1.0 - ((cos * mask_f).sum() / denom)
 
 
+def compute_masked_scalar_mse(student: torch.Tensor, teacher: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    diff = (student.float() - teacher.float()) ** 2
+    if mask is None:
+        return diff.mean()
+    mask_f = mask.to(diff.dtype)
+    denom = mask_f.sum().clamp_min(1.0)
+    return (diff * mask_f).sum() / denom
+
+
 def _unwrap_module_for_attrs(module: nn.Module) -> nn.Module:
     base = module
     while hasattr(base, "module"):
@@ -514,6 +523,29 @@ def project_sana_conditioning_space(
     return y.float()
 
 
+def pack_sana_condition_tokens(y: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, List[int]]:
+    if y.dim() == 4 and y.shape[1] == 1:
+        y = y.squeeze(1)
+    elif y.dim() != 3:
+        raise ValueError(f"Expected conditioning tokens with shape [B, T, C] or [B, 1, T, C], got {tuple(y.shape)}")
+    mask_2d = ensure_token_mask_2d(mask, batch_size=y.shape[0], target_len=y.shape[1], device=y.device)
+    packed = y.masked_select(mask_2d.unsqueeze(-1) != 0).view(1, -1, y.shape[-1])
+    lengths = [int(v) for v in mask_2d.sum(dim=1).tolist()]
+    return packed, lengths
+
+
+def pool_packed_sana_tokens(packed: torch.Tensor, lengths: List[int]) -> torch.Tensor:
+    pooled: List[torch.Tensor] = []
+    start = 0
+    for ln in lengths:
+        if ln <= 0:
+            pooled.append(torch.zeros(1, packed.shape[-1], device=packed.device, dtype=packed.dtype))
+        else:
+            pooled.append(packed[:, start : start + ln, :].mean(dim=1))
+        start += ln
+    return torch.cat(pooled, dim=0)
+
+
 def extract_diffusion_tensor(output: Any) -> torch.Tensor:
     if isinstance(output, torch.Tensor):
         return output
@@ -583,6 +615,42 @@ def pad_or_trim_token_mask(mask: torch.Tensor, target_len: int) -> torch.Tensor:
     pad_len = target_len - cur_len
     pad = torch.zeros((mask.shape[0], pad_len), device=mask.device, dtype=mask.dtype)
     return torch.cat([mask, pad], dim=1)
+
+
+def ensure_token_mask_2d(
+    mask: Optional[torch.Tensor],
+    *,
+    batch_size: int,
+    target_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Normalize token masks to [B, L] and pad/trim to the target length."""
+    if mask is None:
+        return torch.ones((batch_size, target_len), device=device, dtype=torch.long)
+    mask_2d = mask.to(device=device, dtype=torch.long)
+    if mask_2d.dim() == 4:
+        mask_2d = mask_2d.squeeze(1).squeeze(1)
+    elif mask_2d.dim() == 3:
+        mask_2d = mask_2d.squeeze(1)
+    elif mask_2d.dim() == 1:
+        mask_2d = mask_2d.unsqueeze(0)
+    if mask_2d.dim() != 2:
+        raise ValueError(f"Expected mask convertible to [B, L], got shape={tuple(mask.shape)}")
+    mask_2d = pad_or_trim_token_mask(mask_2d, target_len)
+    if mask_2d.shape[0] == 1 and batch_size > 1:
+        mask_2d = mask_2d.expand(batch_size, -1).contiguous()
+    elif mask_2d.shape[0] != batch_size:
+        raise ValueError(
+            f"Mask batch mismatch after normalization: mask={tuple(mask_2d.shape)} batch_size={batch_size}"
+        )
+    return mask_2d
+
+
+def expand_token_mask_4d(mask_2d: torch.Tensor) -> torch.Tensor:
+    """Convert [B, L] token mask to the [B, 1, 1, L] shape expected by SANA DiT."""
+    if mask_2d.dim() != 2:
+        raise ValueError(f"Expected 2D mask [B, L], got shape={tuple(mask_2d.shape)}")
+    return mask_2d.unsqueeze(1).unsqueeze(1)
 
 
 def offdiag_similarity_vector(pooled: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -854,6 +922,13 @@ def build_student(
 
         student = Qwen3VLSanaPromptBridge(
             qwen_ckpt_path=text_encoder_cfg.ckpt_path,
+            **common_kwargs,
+        )
+    elif backbone_type in {"gemma4", "gemma_4"}:
+        from nets.omni.modules.sana_prompt_bridge_gemma4 import Gemma4SanaPromptBridge
+
+        student = Gemma4SanaPromptBridge(
+            gemma_ckpt_path=text_encoder_cfg.ckpt_path,
             **common_kwargs,
         )
     else:
@@ -1263,6 +1338,9 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             )
         if is_main:
             logger.info("Bootstrap stage: using local Qwen3-VL checkpoint at %s", smol_ckpt_path)
+    elif backbone_type in {"gemma4", "gemma_4"}:
+        if is_main:
+            logger.info("Bootstrap stage: using Gemma 4 model id/path %s", smol_ckpt_path)
     elif auto_download_smol:
         if is_main:
             logger.info("Bootstrap stage: ensure_smolvlm2_checkpoint_available (start)")
@@ -1281,6 +1359,36 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             chi_prompt_text = "\n".join(str(x) for x in chi_list)
             if is_main:
                 logger.info("Using SANA chi_prompt prefix (len=%d chars)", len(chi_prompt_text))
+
+    dual_text_cfg = cfg.model.get("dual_text", AttrDict())
+    dual_text_enabled = bool(getattr(dual_text_cfg, "enabled", False))
+    dual_text_use_chi_prompt = bool(getattr(dual_text_cfg, "use_chi_prompt", False))
+    dual_text_native_main = bool(getattr(dual_text_cfg, "native_main", True))
+    dual_text_image_gate_init = float(getattr(dual_text_cfg, "image_gate_init", 0.05) or 0.05)
+    dual_text_aux_channels = int(
+        getattr(
+            dual_text_cfg,
+            "aux_channels",
+            getattr(cfg.model.student.conditioner_bridge, "out_dim", 2304),
+        )
+        or 2304
+    )
+    if dual_text_enabled and not dual_text_native_main:
+        dual_text_native_main = True
+        if is_main:
+            logger.warning("dual_text.native_main=false is not supported in this first design; forcing native_main=true.")
+    if dual_text_enabled:
+        setattr(sana_cfg.model, "cross_attn_image_embeds", True)
+        setattr(sana_cfg.model, "image_embed_channels", dual_text_aux_channels)
+        setattr(sana_cfg.model, "image_gate_init", dual_text_image_gate_init)
+        if is_main:
+            logger.info(
+                "Dual-text late fusion enabled: native SANA text is main branch, Smol bridge is aux branch "
+                "(aux_channels=%d use_chi_prompt=%s image_gate_init=%.4f).",
+                dual_text_aux_channels,
+                dual_text_use_chi_prompt,
+                dual_text_image_gate_init,
+            )
 
     strict_sana_parity_text_path = bool(getattr(cfg.run, "strict_sana_parity_text_path", False))
     strict_sana_use_full_text_window = bool(getattr(cfg.run, "strict_sana_use_full_text_window", False))
@@ -1398,6 +1506,11 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     if bool(dit_lora_cfg.get("enable", False)) and (not dit_train_modules or any(m in {"cross_attn", "all", "*"} for m in dit_train_modules)):
         # Keep only LoRA tensors trainable when DiT LoRA mode is enabled.
         dit_train_modules = ["lora_A", "lora_B"]
+    if dual_text_enabled:
+        dit_train_modules = list(dit_train_modules or [])
+        if any(str(m).lower() in {"all", "*", "cross_attn"} for m in dit_train_modules):
+            if not any("image_embedder" in str(m) for m in dit_train_modules):
+                dit_train_modules.append("image_embedder")
     dit_params = configure_dit_trainable(diffusion_model, dit_train_modules)
     dit_has_trainable = any(p.requires_grad for p in diffusion_model.parameters())
     if not dit_has_trainable:
@@ -2035,7 +2148,9 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     batch_size = args.batch_size or cfg.data.batching.batch_size
     log_every = args.log_every or cfg.run.log_every
     save_every = args.save_every or cfg.run.save_every_steps
-    latest_save_every = args.latest_save_every or int(getattr(cfg.run, "latest_save_every_steps", 0) or 0)
+    latest_save_every = args.latest_save_every or int(
+        getattr(cfg.run, "latest_save_every_steps", getattr(cfg.run, "save_latest_every_steps", 0)) or 0
+    )
     total_steps = args.total_steps or cfg.train.total_steps
     sync_debug_every_cfg = getattr(cfg.run, "sync_debug_log_every_params", 0)
     sync_debug_every = int(0 if sync_debug_every_cfg is None else sync_debug_every_cfg)
@@ -2053,6 +2168,10 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     gate_loss_enabled = bool(getattr(gate_loss_cfg, "enabled", False))
     gate_loss_weight = float(getattr(gate_loss_cfg, "weight", 0.0))
     gate_loss_target = float(getattr(gate_loss_cfg, "target", 1.0))
+    norm_cfg = cfg.loss.get("norm", AttrDict())
+    norm_loss_enabled = bool(getattr(norm_cfg, "enabled", False))
+    norm_loss_weight = float(getattr(norm_cfg, "weight", 0.0) or 0.0)
+    norm_loss_target = float(getattr(norm_cfg, "target", 48.0) or 48.0)
     aux_start_step = int(getattr(cfg.loss, "aux_start_step", 0) or 0)
     log_lora_grad = bool(getattr(cfg.run, "log_lora_grad", False))
     debug_probe_every = int(getattr(cfg.run, "debug_probe_every_steps", 0) or 0)
@@ -2091,6 +2210,19 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     distill_contrastive_temp = float(getattr(distill_cfg, "contrastive_temperature", 0.07) or 0.07)
     distill_hidden0_geom_weight = float(getattr(distill_cfg, "hidden0_geom_weight", 0.0) or 0.0)
     distill_hidden0_geom_layernorm = bool(getattr(distill_cfg, "hidden0_geom_layernorm", True))
+    distill_post_norm_weight = float(getattr(distill_cfg, "post_ynorm_norm_weight", 0.0) or 0.0)
+    distill_packed_norm_weight = float(getattr(distill_cfg, "packed_post_ynorm_norm_weight", 0.0) or 0.0)
+    distill_packed_pooled_norm_weight = float(getattr(distill_cfg, "packed_pooled_norm_weight", 0.0) or 0.0)
+    distill_kv_v_mse_weight = float(getattr(distill_cfg, "kv_v_mse_weight", 0.0) or 0.0)
+    distill_kv_v_cos_weight = float(getattr(distill_cfg, "kv_v_cos_weight", 0.0) or 0.0)
+    distill_kv_v_norm_weight = float(getattr(distill_cfg, "kv_v_norm_weight", 0.0) or 0.0)
+    distill_kv_blocks_cfg = list(getattr(distill_cfg, "kv_blocks", [0, -1]) or [0, -1])
+    distill_kv_blocks: List[int] = []
+    for item in distill_kv_blocks_cfg:
+        try:
+            distill_kv_blocks.append(int(item))
+        except Exception:
+            continue
     distill_use_mask = bool(getattr(distill_cfg, "use_attention_mask", True))
     distill_target_space = canonicalize_distill_target_space(
         str(getattr(distill_cfg, "target_space", "sana_post_ynorm") or "sana_post_ynorm")
@@ -2108,21 +2240,51 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
     else:
         distill_online_use_chi_prompt = bool(distill_online_use_chi_prompt_cfg)
     distill_online_teacher: Optional[SanaTextEncoder] = None
+    dual_text_native_teacher: Optional[SanaTextEncoder] = None
     distill_online_fallback_count = 0
     distill_missing_count = 0
+    distill_requires_sana_token_path = bool(
+        distill_post_norm_weight > 0.0
+        or distill_packed_norm_weight > 0.0
+        or distill_packed_pooled_norm_weight > 0.0
+        or distill_kv_v_mse_weight > 0.0
+        or distill_kv_v_cos_weight > 0.0
+        or distill_kv_v_norm_weight > 0.0
+    )
     functional_cfg = cfg.loss.get("functional", AttrDict())
     functional_enabled = bool(getattr(functional_cfg, "enabled", False))
     functional_pred_mse_weight = float(getattr(functional_cfg, "pred_mse_weight", 0.0) or 0.0)
     functional_pred_cos_weight = float(getattr(functional_cfg, "pred_cos_weight", 0.0) or 0.0)
+    functional_uncond_mse_weight = float(getattr(functional_cfg, "uncond_mse_weight", 0.0) or 0.0)
+    functional_uncond_cos_weight = float(getattr(functional_cfg, "uncond_cos_weight", 0.0) or 0.0)
+    functional_cfg_delta_mse_weight = float(getattr(functional_cfg, "cfg_delta_mse_weight", 0.0) or 0.0)
+    functional_cfg_delta_cos_weight = float(getattr(functional_cfg, "cfg_delta_cos_weight", 0.0) or 0.0)
     functional_every_steps = int(getattr(functional_cfg, "every_steps", 1) or 1)
     if functional_every_steps < 1:
         functional_every_steps = 1
-    if functional_enabled and functional_pred_mse_weight <= 0.0 and functional_pred_cos_weight <= 0.0:
+    if (
+        functional_enabled
+        and functional_pred_mse_weight <= 0.0
+        and functional_pred_cos_weight <= 0.0
+        and functional_uncond_mse_weight <= 0.0
+        and functional_uncond_cos_weight <= 0.0
+        and functional_cfg_delta_mse_weight <= 0.0
+        and functional_cfg_delta_cos_weight <= 0.0
+    ):
         if is_main:
             logger.warning(
-                "functional distill disabled because pred_mse_weight and pred_cos_weight are both zero."
+                "functional distill disabled because all functional loss weights are zero."
             )
         functional_enabled = False
+    functional_requires_uncond = bool(
+        functional_enabled
+        and (
+            functional_uncond_mse_weight > 0.0
+            or functional_uncond_cos_weight > 0.0
+            or functional_cfg_delta_mse_weight > 0.0
+            or functional_cfg_delta_cos_weight > 0.0
+        )
+    )
     semantic_cfg = cfg.loss.get("semantic_probe", AttrDict())
     semantic_enabled = bool(getattr(semantic_cfg, "enabled", False))
     semantic_weight = float(getattr(semantic_cfg, "weight", 0.0) or 0.0)
@@ -2169,6 +2331,19 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             logger.warning("semantic_probe.geom_source=teacher requires distill.enabled=true; geom term disabled.")
         semantic_geom_weight = 0.0
     if distill_enabled:
+        if distill_requires_sana_token_path and distill_target_space != "sana_post_ynorm":
+            if is_main:
+                logger.warning(
+                    "Packed/KV distill losses require target_space=sana_post_ynorm; "
+                    "forcing off those auxiliary losses for target_space=%s.",
+                    distill_target_space,
+                )
+            distill_post_norm_weight = 0.0
+            distill_packed_norm_weight = 0.0
+            distill_packed_pooled_norm_weight = 0.0
+            distill_kv_v_mse_weight = 0.0
+            distill_kv_v_cos_weight = 0.0
+            distill_kv_v_norm_weight = 0.0
         if distill_has_precomputed:
             distill_teacher_store = PrecomputedTeacherStore(
                 distill_precomputed_dir,
@@ -2189,7 +2364,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             )
             logger.info(
                 "Distill enabled: mode=%s precomputed_dir=%s target_space=%s freeze_sana_conditioner=%s "
-                "token_mse=%.3f token_cos=%.3f pooled_cos=%.3f every_steps=%d skip_missing=%s "
+                "token_mse=%.3f token_cos=%.3f pooled_cos=%.3f post_norm=%.3f packed_norm=%.3f packed_pool_norm=%.3f "
+                "kv_v_mse=%.3f kv_v_cos=%.3f kv_v_norm=%.3f kv_blocks=%s every_steps=%d skip_missing=%s "
                 "preload=%s cache=%d online_fallback=%s online_use_chi=%s",
                 distill_mode,
                 distill_precomputed_dir or "<none>",
@@ -2198,6 +2374,13 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 distill_w_mse,
                 distill_w_cos,
                 distill_w_pool,
+                distill_post_norm_weight,
+                distill_packed_norm_weight,
+                distill_packed_pooled_norm_weight,
+                distill_kv_v_mse_weight,
+                distill_kv_v_cos_weight,
+                distill_kv_v_norm_weight,
+                distill_kv_blocks,
                 distill_every_steps,
                 distill_skip_missing,
                 distill_preload,
@@ -2205,11 +2388,34 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 distill_online_fallback,
                 distill_online_use_chi_prompt,
             )
+    if functional_requires_uncond and distill_online_teacher is None:
+        distill_online_teacher = SanaTextEncoder(sana_cfg, device=device, dtype=dtype)
+        distill_online_teacher.eval().requires_grad_(False)
+        if is_main:
+            logger.info(
+                "Functional uncond/cfg-delta distill requested; initialized an online SANA teacher "
+                "for unconditional prompt supervision."
+            )
+    if dual_text_enabled:
+        dual_text_native_teacher = distill_online_teacher
+        if dual_text_native_teacher is None:
+            dual_text_native_teacher = SanaTextEncoder(sana_cfg, device=device, dtype=dtype)
+        dual_text_native_teacher.eval().requires_grad_(False)
+        if is_main:
+            logger.info(
+                "Dual-text native branch initialized from frozen SANA text encoder (use_chi_prompt=%s).",
+                dual_text_use_chi_prompt,
+            )
     if functional_enabled and is_main:
         logger.info(
-            "Functional distill enabled: pred_mse=%.3f pred_cos=%.3f every_steps=%d",
+            "Functional distill enabled: pred_mse=%.3f pred_cos=%.3f "
+            "uncond_mse=%.3f uncond_cos=%.3f cfg_delta_mse=%.3f cfg_delta_cos=%.3f every_steps=%d",
             functional_pred_mse_weight,
             functional_pred_cos_weight,
+            functional_uncond_mse_weight,
+            functional_uncond_cos_weight,
+            functional_cfg_delta_mse_weight,
+            functional_cfg_delta_cos_weight,
             functional_every_steps,
         )
     if is_main and aux_start_step > 0:
@@ -2354,9 +2560,14 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             )
         if functional_enabled:
             logger.info(
-                "Functional distill enabled: pred_mse=%.4f pred_cos=%.4f every=%d",
+                "Functional distill enabled: pred_mse=%.4f pred_cos=%.4f "
+                "uncond_mse=%.4f uncond_cos=%.4f cfg_delta_mse=%.4f cfg_delta_cos=%.4f every=%d",
                 functional_pred_mse_weight,
                 functional_pred_cos_weight,
+                functional_uncond_mse_weight,
+                functional_uncond_cos_weight,
+                functional_cfg_delta_mse_weight,
+                functional_cfg_delta_cos_weight,
                 functional_every_steps,
             )
 
@@ -2731,6 +2942,26 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             student_embeds_for_dit = student_embeds_for_dit.unsqueeze(0)
         elif student_embeds_for_dit.dim() != 3:
             raise RuntimeError(f"Unexpected student_embeds_for_dit shape: {tuple(student_embeds_for_dit.shape)}")
+        native_main_embeds = None
+        native_main_mask = None
+        if dual_text_enabled:
+            if dual_text_native_teacher is None:
+                raise RuntimeError("dual_text.enabled=true but no native SANA text encoder is initialized.")
+            with torch.no_grad():
+                native_out = dual_text_native_teacher.forward_chi(
+                    prompts,
+                    use_chi_prompt=dual_text_use_chi_prompt,
+                )
+            native_main_embeds = native_out["prompt_embeds"].to(
+                device=device,
+                dtype=student_embeds_raw.dtype,
+                non_blocking=True,
+            )
+            native_main_mask = native_out["mask"].to(
+                device=device,
+                dtype=torch.long,
+                non_blocking=True,
+            )
         teacher_embeds = None
         teacher_mask = None
         step_id = int(update_step + 1)
@@ -2836,30 +3067,42 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                         teacher_embeds, teacher_mask, student_embeds_raw.shape[1]
                     )
 
-        # Use prompt mask from student tokenizer/bridge (important for variable-length prompts).
+        # Student branch always serves as the auxiliary dual-text path, so normalize its mask first.
         if student_prompt_mask is None:
             if strict_fail_fast_mask:
                 raise RuntimeError(
                     "Strict fail-fast mask enabled: student returned None prompt mask. "
                     "Check tokenizer/bridge output parity."
                 )
-            mask = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)
+            student_mask_for_aux_2d = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)
         else:
-            mask = student_prompt_mask.to(device=device, dtype=torch.long)
-            if mask.shape[:2] != student_embeds_for_dit.shape[:2]:
+            student_mask_for_aux_2d = student_prompt_mask.to(device=device, dtype=torch.long)
+            if student_mask_for_aux_2d.shape[:2] != student_embeds_for_dit.shape[:2]:
                 if strict_fail_fast_mask:
                     raise RuntimeError(
                         "Strict fail-fast mask enabled: prompt mask shape mismatch "
-                        f"mask={tuple(mask.shape)} embeds={tuple(student_embeds_for_dit.shape)}"
+                        f"mask={tuple(student_mask_for_aux_2d.shape)} embeds={tuple(student_embeds_for_dit.shape)}"
                     )
-                # TODO(cleanup): remove this silent fallback once mask pipeline is stable.
-                # Keeping all-ones here can hide conditioning-mask bugs during triage.
-                mask = torch.ones(student_embeds_for_dit.shape[:2], device=device, dtype=torch.long)
-        if mask.dim() == 1:
-            mask = mask.unsqueeze(0)
-        if mask.dim() == 2:
-            # SANA forward expects mask compatible with squeeze(1).squeeze(1) path.
-            mask = mask.unsqueeze(1).unsqueeze(1)
+                student_mask_for_aux_2d = torch.ones(
+                    student_embeds_for_dit.shape[:2], device=device, dtype=torch.long
+                )
+        if student_mask_for_aux_2d.dim() == 1:
+            student_mask_for_aux_2d = student_mask_for_aux_2d.unsqueeze(0)
+
+        model_cond_embeds = student_embeds_for_dit
+        if dual_text_enabled:
+            if native_main_embeds is None or native_main_mask is None:
+                raise RuntimeError("dual_text.enabled=true but native main embeddings were not produced.")
+            native_main_mask_2d = ensure_token_mask_2d(
+                native_main_mask,
+                batch_size=native_main_embeds.shape[0],
+                target_len=native_main_embeds.shape[1],
+                device=device,
+            )
+            model_cond_embeds = native_main_embeds.to(device=device, dtype=dtype)
+            mask = expand_token_mask_4d(native_main_mask_2d)
+        else:
+            mask = expand_token_mask_4d(student_mask_for_aux_2d)
 
         latents = batch.get("latent_feature")
         if latents is None:
@@ -3048,9 +3291,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 aspect_ratio = aspect_ratio.repeat(b, 1)
             if aspect_ratio.shape[0] == b:
                 data_info["aspect_ratio"] = aspect_ratio
+        if dual_text_enabled:
+            data_info["image_embeds"] = student_embeds_for_dit
+            data_info["image_embeds_mask"] = student_mask_for_aux_2d
         # SANA DiT expects condition as [B, 1, L, C] and mask as [B, L].
         model_kwargs = {
-            "y": student_embeds_for_dit.unsqueeze(1),
+            "y": model_cond_embeds.unsqueeze(1),
             "mask": mask,
             "data_info": data_info,
         }
@@ -3069,7 +3315,7 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             if cond_mask_2d.dim() == 2:
                 cond_mask_nonpad = float(cond_mask_2d.float().mean().item())
                 cond_mask_tok_mean = float(cond_mask_2d.float().sum(dim=1).mean().item())
-        cond_y_token_norm = student_embeds_for_dit.float().norm(dim=-1)
+        cond_y_token_norm = model_cond_embeds.float().norm(dim=-1)
         cond_y_norm_mean = float(cond_y_token_norm.mean().item())
         cond_y_norm_std = float(cond_y_token_norm.std(unbiased=False).item())
         if is_first_logged_iter:
@@ -3293,8 +3539,18 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
         distill_pooled_loss = torch.tensor(0.0, device=device)
         distill_contrastive_loss = torch.tensor(0.0, device=device)
         distill_hidden0_geom_loss = torch.tensor(0.0, device=device)
+        distill_post_norm_loss = torch.tensor(0.0, device=device)
+        distill_packed_norm_loss = torch.tensor(0.0, device=device)
+        distill_packed_pooled_norm_loss = torch.tensor(0.0, device=device)
+        distill_kv_v_mse_loss = torch.tensor(0.0, device=device)
+        distill_kv_v_cos_loss = torch.tensor(0.0, device=device)
+        distill_kv_v_norm_loss = torch.tensor(0.0, device=device)
         functional_pred_mse_loss = torch.tensor(0.0, device=device)
         functional_pred_cos_loss = torch.tensor(0.0, device=device)
+        functional_uncond_mse_loss = torch.tensor(0.0, device=device)
+        functional_uncond_cos_loss = torch.tensor(0.0, device=device)
+        functional_cfg_delta_mse_loss = torch.tensor(0.0, device=device)
+        functional_cfg_delta_cos_loss = torch.tensor(0.0, device=device)
         if aux_active and distill_enabled and teacher_embeds is not None:
             student_mask_2d = student_prompt_mask
             if isinstance(student_mask_2d, torch.Tensor):
@@ -3317,13 +3573,28 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     target_space=distill_target_space,
                     freeze_modules_for_grad=False,
                 )
-            dmask = teacher_mask if distill_use_mask else None
+            teacher_mask_2d = ensure_token_mask_2d(
+                teacher_mask,
+                batch_size=teacher_distill.shape[0],
+                target_len=teacher_distill.shape[1],
+                device=device,
+            )
+            common_distill_mask = teacher_mask_2d
+            if student_mask_2d is not None:
+                common_distill_mask = ((teacher_mask_2d > 0) & (student_mask_2d > 0)).to(dtype=torch.long)
+            dmask = common_distill_mask if distill_use_mask else None
             pooled_student = None
             pooled_teacher = None
             if distill_w_mse > 0.0:
                 distill_mse_loss = compute_masked_mse(student_distill, teacher_distill, dmask)
             if distill_w_cos > 0.0:
                 distill_cos_loss = compute_masked_token_cos(student_distill, teacher_distill, dmask)
+            if distill_post_norm_weight > 0.0:
+                distill_post_norm_loss = compute_masked_scalar_mse(
+                    student_distill.float().norm(dim=-1),
+                    teacher_distill.float().norm(dim=-1),
+                    dmask,
+                )
             if (
                 distill_w_pool > 0.0
                 or distill_w_contrastive > 0.0
@@ -3363,18 +3634,86 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     pooled_student_geom,
                     pooled_hidden0,
                 )
+            if (
+                distill_packed_norm_weight > 0.0
+                or distill_packed_pooled_norm_weight > 0.0
+                or distill_kv_v_mse_weight > 0.0
+                or distill_kv_v_cos_weight > 0.0
+                or distill_kv_v_norm_weight > 0.0
+            ):
+                packed_mask = common_distill_mask
+                student_packed_distill, packed_lengths = pack_sana_condition_tokens(student_distill, packed_mask)
+                teacher_packed_distill, teacher_packed_lengths = pack_sana_condition_tokens(teacher_distill, packed_mask)
+                if packed_lengths != teacher_packed_lengths:
+                    raise RuntimeError(
+                        f"Packed SANA token lengths mismatch: student={packed_lengths[:4]} teacher={teacher_packed_lengths[:4]}"
+                    )
+                if distill_packed_norm_weight > 0.0:
+                    distill_packed_norm_loss = F.mse_loss(
+                        student_packed_distill.float().norm(dim=-1),
+                        teacher_packed_distill.float().norm(dim=-1),
+                    )
+                pooled_student_packed = None
+                pooled_teacher_packed = None
+                if distill_packed_pooled_norm_weight > 0.0 or distill_kv_v_norm_weight > 0.0:
+                    pooled_student_packed = pool_packed_sana_tokens(student_packed_distill, packed_lengths)
+                    pooled_teacher_packed = pool_packed_sana_tokens(teacher_packed_distill, packed_lengths)
+                if distill_packed_pooled_norm_weight > 0.0 and pooled_student_packed is not None and pooled_teacher_packed is not None:
+                    distill_packed_pooled_norm_loss = F.mse_loss(
+                        pooled_student_packed.float().norm(dim=-1),
+                        pooled_teacher_packed.float().norm(dim=-1),
+                    )
+                if (
+                    (distill_kv_v_mse_weight > 0.0 or distill_kv_v_cos_weight > 0.0 or distill_kv_v_norm_weight > 0.0)
+                    and len(distill_kv_blocks) > 0
+                ):
+                    diffusion_module_for_distill = _unwrap_module_for_attrs(diffusion_model)
+                    blocks = list(getattr(diffusion_module_for_distill, "blocks", []) or [])
+                    kv_v_mse_terms: List[torch.Tensor] = []
+                    kv_v_cos_terms: List[torch.Tensor] = []
+                    kv_v_norm_terms: List[torch.Tensor] = []
+                    for block_idx in distill_kv_blocks:
+                        actual_idx = block_idx if block_idx >= 0 else (len(blocks) + block_idx)
+                        if actual_idx < 0 or actual_idx >= len(blocks):
+                            continue
+                        block = blocks[actual_idx]
+                        cross_attn = getattr(block, "cross_attn", None)
+                        kv_linear = getattr(cross_attn, "kv_linear", None)
+                        if kv_linear is None:
+                            continue
+                        kv_dtype = kv_linear.weight.dtype
+                        student_packed_kv = student_packed_distill.to(dtype=kv_dtype)
+                        teacher_packed_kv = teacher_packed_distill.to(dtype=kv_dtype)
+                        kv_dim = student_packed_kv.shape[-1]
+                        student_kv = kv_linear(student_packed_kv).view(1, -1, 2, kv_dim)
+                        teacher_kv = kv_linear(teacher_packed_kv).view(1, -1, 2, kv_dim)
+                        _, student_v = student_kv.unbind(2)
+                        _, teacher_v = teacher_kv.unbind(2)
+                        student_v = student_v.float()
+                        teacher_v = teacher_v.float()
+                        if distill_kv_v_mse_weight > 0.0:
+                            kv_v_mse_terms.append(((student_v - teacher_v) ** 2).mean())
+                        if distill_kv_v_cos_weight > 0.0:
+                            kv_v_cos_terms.append(1.0 - F.cosine_similarity(student_v, teacher_v, dim=-1).mean())
+                        if distill_kv_v_norm_weight > 0.0:
+                            kv_v_norm_terms.append(
+                                F.mse_loss(student_v.norm(dim=-1), teacher_v.norm(dim=-1))
+                            )
+                    if kv_v_mse_terms:
+                        distill_kv_v_mse_loss = torch.stack(kv_v_mse_terms).mean()
+                    if kv_v_cos_terms:
+                        distill_kv_v_cos_loss = torch.stack(kv_v_cos_terms).mean()
+                    if kv_v_norm_terms:
+                        distill_kv_v_norm_loss = torch.stack(kv_v_norm_terms).mean()
         if aux_active and functional_run_this_step and teacher_embeds is not None:
             teacher_embeds_for_dit = teacher_embeds.to(device=device, dtype=dtype, non_blocking=True)
-            if teacher_mask is None:
-                teacher_mask_for_dit = torch.ones(
-                    teacher_embeds_for_dit.shape[:2], device=device, dtype=torch.long
-                )
-            else:
-                teacher_mask_for_dit = teacher_mask.to(device=device, dtype=torch.long)
-                if teacher_mask_for_dit.dim() == 1:
-                    teacher_mask_for_dit = teacher_mask_for_dit.unsqueeze(0)
-            if teacher_mask_for_dit.dim() == 2:
-                teacher_mask_for_dit = teacher_mask_for_dit.unsqueeze(1).unsqueeze(1)
+            teacher_mask_for_dit_2d = ensure_token_mask_2d(
+                teacher_mask,
+                batch_size=teacher_embeds_for_dit.shape[0],
+                target_len=teacher_embeds_for_dit.shape[1],
+                device=device,
+            )
+            teacher_mask_for_dit = expand_token_mask_4d(teacher_mask_for_dit_2d)
             teacher_model_kwargs = {
                 "mask": teacher_mask_for_dit,
                 "data_info": data_info,
@@ -3382,6 +3721,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             if chunk_index is not None:
                 teacher_model_kwargs["chunk_index"] = chunk_index
             student_model_pred = extract_diffusion_tensor(loss_term["output"]).float()
+            student_uncond_pred = None
+            teacher_uncond_pred = None
             with torch.no_grad():
                 teacher_model_pred = extract_diffusion_tensor(
                     diffusion_model(
@@ -3391,6 +3732,96 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                         **teacher_model_kwargs,
                     )
                 ).float()
+            if functional_requires_uncond:
+                student_uncond_raw, student_uncond_mask = get_fixed_uncond_batch(
+                    batch_size_local=student_embeds_for_dit.shape[0],
+                    target_len=student_embeds_for_dit.shape[1],
+                    target_dtype=student_embeds_raw.dtype,
+                )
+                if student_uncond_raw is None:
+                    student_uncond_prompts = [cfg_delta_uncond_prompt] * len(prompts_cond)
+                    student_uncond_out = student(student_uncond_prompts, return_mask=True)
+                    student_uncond_raw, student_uncond_mask = student_uncond_out
+                    if student_uncond_raw.dim() == 1:
+                        student_uncond_raw = student_uncond_raw.unsqueeze(0).unsqueeze(0)
+                    elif student_uncond_raw.dim() == 2:
+                        student_uncond_raw = student_uncond_raw.unsqueeze(0)
+                    elif student_uncond_raw.dim() != 3:
+                        raise RuntimeError(
+                            f"Unexpected student uncond embedding shape: {tuple(student_uncond_raw.shape)}"
+                        )
+                if student_pre_dit_layernorm:
+                    student_uncond_for_dit = F.layer_norm(
+                        student_uncond_raw, (student_uncond_raw.shape[-1],)
+                    )
+                else:
+                    student_uncond_for_dit = student_uncond_raw
+                student_uncond_for_dit = student_uncond_for_dit.to(device=device, dtype=dtype)
+                student_uncond_mask_2d = ensure_token_mask_2d(
+                    student_uncond_mask,
+                    batch_size=student_uncond_for_dit.shape[0],
+                    target_len=student_uncond_for_dit.shape[1],
+                    device=device,
+                )
+                student_uncond_model_kwargs = {
+                    "mask": expand_token_mask_4d(student_uncond_mask_2d),
+                    "data_info": data_info,
+                }
+                if chunk_index is not None:
+                    student_uncond_model_kwargs["chunk_index"] = chunk_index
+                student_uncond_pred = extract_diffusion_tensor(
+                    diffusion_model(
+                        noisy_for_cfg,
+                        timesteps,
+                        student_uncond_for_dit.unsqueeze(1),
+                        **student_uncond_model_kwargs,
+                    )
+                ).float()
+
+                if distill_online_teacher is None:
+                    raise RuntimeError(
+                        "Functional cfg-delta distill requires an online SANA teacher for unconditional prompts."
+                    )
+                with torch.no_grad():
+                    teacher_uncond_out = distill_online_teacher.forward_chi(
+                        [cfg_delta_uncond_prompt] * len(prompts_cond),
+                        use_chi_prompt=distill_online_use_chi_prompt,
+                    )
+                    teacher_uncond_embeds = teacher_uncond_out["prompt_embeds"].to(
+                        device=device,
+                        dtype=dtype,
+                        non_blocking=True,
+                    )
+                    teacher_uncond_mask = teacher_uncond_out["mask"].to(
+                        device=device,
+                        dtype=torch.long,
+                        non_blocking=True,
+                    )
+                    teacher_uncond_embeds, teacher_uncond_mask = pad_or_trim_teacher(
+                        teacher_uncond_embeds,
+                        teacher_uncond_mask,
+                        student_embeds_for_dit.shape[1],
+                    )
+                    teacher_uncond_mask_2d = ensure_token_mask_2d(
+                        teacher_uncond_mask,
+                        batch_size=teacher_uncond_embeds.shape[0],
+                        target_len=teacher_uncond_embeds.shape[1],
+                        device=device,
+                    )
+                    teacher_uncond_model_kwargs = {
+                        "mask": expand_token_mask_4d(teacher_uncond_mask_2d),
+                        "data_info": data_info,
+                    }
+                    if chunk_index is not None:
+                        teacher_uncond_model_kwargs["chunk_index"] = chunk_index
+                    teacher_uncond_pred = extract_diffusion_tensor(
+                        diffusion_model(
+                            noisy_for_cfg,
+                            timesteps,
+                            teacher_uncond_embeds.unsqueeze(1),
+                            **teacher_uncond_model_kwargs,
+                        )
+                    ).float()
             if functional_pred_mse_weight > 0.0:
                 functional_pred_mse_loss = F.mse_loss(student_model_pred, teacher_model_pred)
             if functional_pred_cos_weight > 0.0:
@@ -3399,6 +3830,25 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     teacher_model_pred.reshape(teacher_model_pred.shape[0], -1),
                     dim=-1,
                 ).mean()
+            if student_uncond_pred is not None and teacher_uncond_pred is not None:
+                if functional_uncond_mse_weight > 0.0:
+                    functional_uncond_mse_loss = F.mse_loss(student_uncond_pred, teacher_uncond_pred)
+                if functional_uncond_cos_weight > 0.0:
+                    functional_uncond_cos_loss = 1.0 - F.cosine_similarity(
+                        student_uncond_pred.reshape(student_uncond_pred.shape[0], -1),
+                        teacher_uncond_pred.reshape(teacher_uncond_pred.shape[0], -1),
+                        dim=-1,
+                    ).mean()
+                student_cfg_delta = student_model_pred - student_uncond_pred
+                teacher_cfg_delta = teacher_model_pred - teacher_uncond_pred
+                if functional_cfg_delta_mse_weight > 0.0:
+                    functional_cfg_delta_mse_loss = F.mse_loss(student_cfg_delta, teacher_cfg_delta)
+                if functional_cfg_delta_cos_weight > 0.0:
+                    functional_cfg_delta_cos_loss = 1.0 - F.cosine_similarity(
+                        student_cfg_delta.reshape(student_cfg_delta.shape[0], -1),
+                        teacher_cfg_delta.reshape(teacher_cfg_delta.shape[0], -1),
+                        dim=-1,
+                    ).mean()
 
         semantic_var_loss = torch.tensor(0.0, device=device)
         semantic_cov_loss = torch.tensor(0.0, device=device)
@@ -3463,10 +3913,11 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                         logger.warning("semantic geom loss compute failed: %s", exc)
 
         norm_loss = torch.tensor(0.0, device=device)
-        if aux_active and cfg.loss.norm.enabled:
+        if aux_active and norm_loss_enabled:
             token_norm = student_embeds_for_dit.float().norm(dim=-1)
-            norm_target = float(cfg.loss.norm.target)
-            norm_loss = ((token_norm - norm_target) ** 2).mean().to(device=device, dtype=student_embeds_for_dit.dtype)
+            norm_loss = ((token_norm - norm_loss_target) ** 2).mean().to(
+                device=device, dtype=student_embeds_for_dit.dtype
+            )
         # Disable gradient sync on accumulation micro-steps for wrapped modules.
         with contextlib.ExitStack() as sync_stack:
             if not is_sync_step:
@@ -3485,15 +3936,25 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
 
             loss = (
                 diff_weight * diff_loss
-                + cfg.loss.norm.weight * norm_loss
+                + norm_loss_weight * norm_loss
                 + gate_loss_weight * gate_loss
                 + distill_w_mse * distill_mse_loss
                 + distill_w_cos * distill_cos_loss
                 + distill_w_pool * distill_pooled_loss
                 + distill_w_contrastive * distill_contrastive_loss
                 + distill_hidden0_geom_weight * distill_hidden0_geom_loss
+                + distill_post_norm_weight * distill_post_norm_loss
+                + distill_packed_norm_weight * distill_packed_norm_loss
+                + distill_packed_pooled_norm_weight * distill_packed_pooled_norm_loss
+                + distill_kv_v_mse_weight * distill_kv_v_mse_loss
+                + distill_kv_v_cos_weight * distill_kv_v_cos_loss
+                + distill_kv_v_norm_weight * distill_kv_v_norm_loss
                 + functional_pred_mse_weight * functional_pred_mse_loss
                 + functional_pred_cos_weight * functional_pred_cos_loss
+                + functional_uncond_mse_weight * functional_uncond_mse_loss
+                + functional_uncond_cos_weight * functional_uncond_cos_loss
+                + functional_cfg_delta_mse_weight * functional_cfg_delta_mse_loss
+                + functional_cfg_delta_cos_weight * functional_cfg_delta_cos_loss
                 + semantic_weight
                 * (
                     semantic_var_weight * semantic_var_loss
@@ -3723,14 +4184,22 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 emb_std = student_embeds_for_dit.float().std(unbiased=False).item()
                 token_norm_mean = student_embeds_for_dit.float().norm(dim=-1).mean().item()
                 gate_raw = float(student_module.adapter_output_gate.detach().float().item())
+                aux_gate_mean = float("nan")
                 lexical_gate_value = float("nan")
                 projector_obj = getattr(student_module, "projector", None)
                 if projector_obj is not None and hasattr(projector_obj, "lexical_gate_logit"):
                     lexical_gate_value = float(
                         torch.sigmoid(projector_obj.lexical_gate_logit.detach().float()).item()
                     )
+                aux_gate_vals = [
+                    float(p.detach().float().item())
+                    for name, p in diffusion_model.named_parameters()
+                    if name.endswith("image_gate")
+                ]
+                if aux_gate_vals:
+                    aux_gate_mean = float(sum(aux_gate_vals) / len(aux_gate_vals))
             log_line = (
-                "Step %d | mode=%s loss=%.6f diff=%.6f d_mse=%.6f d_cos=%.6f d_pool=%.6f d_nce=%.6f d_h0geom=%.6f norm=%.6f offdiag_cos=%.4f grad=%.4f "
+                "Step %d | mode=%s loss=%.6f diff=%.6f d_mse=%.6f d_cos=%.6f d_pool=%.6f d_nce=%.6f d_h0geom=%.6f d_postnorm=%.6f d_packnorm=%.6f d_packpoolnorm=%.6f d_kvv_mse=%.6f d_kvv_cos=%.6f d_kvv_norm=%.6f norm=%.6f offdiag_cos=%.4f grad=%.4f "
                 "emb_mean=%.4f emb_std=%.4f tok_norm=%.4f gate=%.4f cfg_drop=%.3f"
             ) % (
                 update_step,
@@ -3742,6 +4211,12 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                 distill_pooled_loss.item(),
                 distill_contrastive_loss.item(),
                 distill_hidden0_geom_loss.item(),
+                distill_post_norm_loss.item(),
+                distill_packed_norm_loss.item(),
+                distill_packed_pooled_norm_loss.item(),
+                distill_kv_v_mse_loss.item(),
+                distill_kv_v_cos_loss.item(),
+                distill_kv_v_norm_loss.item(),
                 norm_loss.item(),
                 offdiag,
                 grad_norm,
@@ -3753,6 +4228,8 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
             )
             if not math.isnan(lexical_gate_value):
                 log_line += " lex_gate=%.4f" % lexical_gate_value
+            if not math.isnan(aux_gate_mean):
+                log_line += " aux_gate=%.4f" % aux_gate_mean
             if joint_enabled:
                 log_line += " v_micro=%d i_micro=%d" % (video_micro_count, image_micro_count)
             if log_lora_grad:
@@ -3796,9 +4273,13 @@ def train_teacher_free(cfg: AttrDict, args: argparse.Namespace):
                     cond_pred_delta_ratio,
                 )
             if functional_enabled:
-                log_line += " f_pred_mse=%.6f f_pred_cos=%.6f" % (
+                log_line += " f_pred_mse=%.6f f_pred_cos=%.6f f_uncond_mse=%.6f f_uncond_cos=%.6f f_cfgdelta_mse=%.6f f_cfgdelta_cos=%.6f" % (
                     functional_pred_mse_loss.item(),
                     functional_pred_cos_loss.item(),
+                    functional_uncond_mse_loss.item(),
+                    functional_uncond_cos_loss.item(),
+                    functional_cfg_delta_mse_loss.item(),
+                    functional_cfg_delta_cos_loss.item(),
                 )
             if semantic_enabled:
                 log_line += " sem_var=%.6f sem_cov=%.6f sem_geom=%.6f" % (

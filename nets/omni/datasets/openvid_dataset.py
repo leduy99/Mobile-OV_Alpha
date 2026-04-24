@@ -1,6 +1,10 @@
 import os
 import pickle
 import logging
+import hashlib
+import json
+import tempfile
+import time
 import numpy as np
 import torch
 import pandas as pd
@@ -8,6 +12,17 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Dict, Set, Union
 
 logger = logging.getLogger(__name__)
+
+_DATASET_CACHE_VERSION = 1
+_DATASET_CACHE_WAIT_SECONDS = 2.0
+_DATASET_CACHE_STALE_LOCK_SECONDS = 60.0 * 30.0
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
 
 
 class OpenVidDataset(Dataset):
@@ -43,6 +58,9 @@ class OpenVidDataset(Dataset):
         self.video_dir = video_dir
         self.preprocessed_dir = preprocessed_dir
         self.use_preprocessed = use_preprocessed
+        self.rank = int(os.environ.get("RANK", "0") or 0)
+        self.dataset_cache_enabled = _env_flag("MOBILEOV_DATASET_CACHE", True)
+        self.trust_preprocessed_manifest = _env_flag("MOBILEOV_TRUST_PREPROCESSED_MANIFEST", True)
         self.modality_filter: Optional[Set[str]] = None
         if modality_filter is not None:
             if isinstance(modality_filter, str):
@@ -51,25 +69,187 @@ class OpenVidDataset(Dataset):
                 values = list(modality_filter)
             normalized = {str(v).strip().lower() for v in values if str(v).strip()}
             self.modality_filter = normalized if normalized else None
+        cache_path = self._get_cache_path(
+            csv_path=csv_path,
+            video_dir=video_dir,
+            preprocessed_dir=preprocessed_dir,
+            max_samples=max_samples,
+        )
+        self.data = self._load_or_build_index(
+            csv_path=csv_path,
+            video_dir=video_dir,
+            preprocessed_dir=preprocessed_dir,
+            max_samples=max_samples,
+            cache_path=cache_path,
+        )
         
-        # Load CSV file
-        logger.info(f"Loading OpenVid-1M CSV from {csv_path}")
+        if self.modality_filter is None:
+            logger.info(f"Loaded {len(self.data)} valid samples from OpenVid-style CSV")
+        else:
+            logger.info(
+                "Loaded %d valid samples from OpenVid-style CSV (modality_filter=%s)",
+                len(self.data),
+                sorted(self.modality_filter),
+            )
+
+    def _get_cache_path(
+        self,
+        csv_path: str,
+        video_dir: str,
+        preprocessed_dir: Optional[str],
+        max_samples: Optional[int],
+    ) -> Optional[str]:
+        if not self.dataset_cache_enabled:
+            return None
+        csv_abs = os.path.abspath(csv_path)
         try:
-            # Try reading with different quoting options
-            try:
-                df = pd.read_csv(csv_path, quoting=1, escapechar='\\')  # QUOTE_ALL with escape char
-            except:
+            csv_stat = os.stat(csv_abs)
+            csv_sig = {"size": int(csv_stat.st_size), "mtime_ns": int(csv_stat.st_mtime_ns)}
+        except OSError:
+            csv_sig = {"size": -1, "mtime_ns": -1}
+        cache_root = os.environ.get(
+            "MOBILEOV_DATASET_CACHE_DIR",
+            os.path.join(os.path.expanduser("~"), ".cache", "mobileov_dataset_cache"),
+        )
+        cache_key = {
+            "version": _DATASET_CACHE_VERSION,
+            "csv_path": csv_abs,
+            "csv_sig": csv_sig,
+            "video_dir": os.path.abspath(video_dir),
+            "preprocessed_dir": os.path.abspath(preprocessed_dir) if preprocessed_dir else "",
+            "use_preprocessed": bool(self.use_preprocessed),
+            "max_samples": int(max_samples) if max_samples is not None else None,
+            "modality_filter": sorted(self.modality_filter) if self.modality_filter is not None else None,
+            "trust_preprocessed_manifest": bool(self.trust_preprocessed_manifest),
+        }
+        key_text = json.dumps(cache_key, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha1(key_text.encode("utf-8")).hexdigest()[:16]
+        os.makedirs(cache_root, exist_ok=True)
+        return os.path.join(cache_root, f"openvid_index_{digest}.pkl")
+
+    def _load_or_build_index(
+        self,
+        csv_path: str,
+        video_dir: str,
+        preprocessed_dir: Optional[str],
+        max_samples: Optional[int],
+        cache_path: Optional[str],
+    ) -> List[Dict[str, object]]:
+        lock_fd = None
+        lock_path = f"{cache_path}.lock" if cache_path else None
+        if cache_path:
+            cached = self._try_load_cache(cache_path)
+            if cached is not None:
+                return cached
+            lock_fd = self._try_acquire_lock(lock_path)
+            if lock_fd is None:
+                cached = self._wait_for_cache(cache_path, lock_path)
+                if cached is not None:
+                    return cached
+                lock_fd = self._try_acquire_lock(lock_path)
+
+        try:
+            data = self._build_index_from_csv(
+                csv_path=csv_path,
+                video_dir=video_dir,
+                preprocessed_dir=preprocessed_dir,
+                max_samples=max_samples,
+            )
+            if cache_path and lock_fd is not None:
+                self._write_cache(cache_path, data)
+            return data
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
                 try:
-                    df = pd.read_csv(csv_path, quoting=1)  # QUOTE_ALL
-                except:
-                    df = pd.read_csv(csv_path)  # Default
+                    os.unlink(lock_path)
+                except FileNotFoundError:
+                    pass
+
+    def _try_load_cache(self, cache_path: str) -> Optional[List[Dict[str, object]]]:
+        if not cache_path or not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "rb") as f:
+                payload = pickle.load(f)
+            if not isinstance(payload, dict) or payload.get("version") != _DATASET_CACHE_VERSION:
+                logger.warning("Ignoring stale dataset cache at %s", cache_path)
+                return None
+            data = payload.get("data")
+            if not isinstance(data, list):
+                logger.warning("Ignoring malformed dataset cache at %s", cache_path)
+                return None
+            logger.info("Loaded dataset index cache from %s (%d samples)", cache_path, len(data))
+            return data
+        except Exception as exc:
+            logger.warning("Failed to load dataset cache %s: %s", cache_path, exc)
+            return None
+
+    def _try_acquire_lock(self, lock_path: Optional[str]) -> Optional[int]:
+        if not lock_path:
+            return None
+        try:
+            return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return None
+
+    def _wait_for_cache(self, cache_path: str, lock_path: Optional[str]) -> Optional[List[Dict[str, object]]]:
+        if not lock_path:
+            return None
+        wait_logged = False
+        while True:
+            cached = self._try_load_cache(cache_path)
+            if cached is not None:
+                return cached
+            if not os.path.exists(lock_path):
+                return None
+            if not wait_logged:
+                logger.info("Waiting for dataset cache builder to finish: %s", cache_path)
+                wait_logged = True
+            try:
+                lock_age = time.time() - os.path.getmtime(lock_path)
+                if lock_age > _DATASET_CACHE_STALE_LOCK_SECONDS:
+                    logger.warning("Removing stale dataset cache lock: %s", lock_path)
+                    os.unlink(lock_path)
+                    return None
+            except FileNotFoundError:
+                return None
+            time.sleep(_DATASET_CACHE_WAIT_SECONDS)
+
+    def _write_cache(self, cache_path: str, data: List[Dict[str, object]]) -> None:
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp_openvid_index_", suffix=".pkl", dir=os.path.dirname(cache_path))
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                pickle.dump({"version": _DATASET_CACHE_VERSION, "data": data}, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+            logger.info("Saved dataset index cache to %s (%d samples)", cache_path, len(data))
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    def _load_csv(self, csv_path: str) -> pd.DataFrame:
+        logger.info("Loading OpenVid-1M CSV from %s", csv_path)
+        try:
+            try:
+                return pd.read_csv(csv_path, quoting=1, escapechar="\\")
+            except Exception:
+                try:
+                    return pd.read_csv(csv_path, quoting=1)
+                except Exception:
+                    return pd.read_csv(csv_path)
         except Exception as e:
             logger.error(f"Failed to load CSV file: {e}")
             raise
-        
-        # Supported schemas:
-        # 1) Legacy OpenVid schema: [video, caption, ...]
-        # 2) Unified/mixed schema: [caption, preprocessed_path, ...] or [caption, sample_idx, ...]
+
+    def _build_index_from_csv(
+        self,
+        csv_path: str,
+        video_dir: str,
+        preprocessed_dir: Optional[str],
+        max_samples: Optional[int],
+    ) -> List[Dict[str, object]]:
+        df = self._load_csv(csv_path)
+
         has_caption_col = "caption" in df.columns
         has_video_col = "video" in df.columns
         has_preprocessed_path_col = "preprocessed_path" in df.columns
@@ -77,17 +257,125 @@ class OpenVidDataset(Dataset):
         if not has_caption_col:
             raise ValueError("CSV file must contain 'caption' column")
         self.direct_preprocessed_mode = bool(
-            use_preprocessed and (has_preprocessed_path_col or has_sample_idx_col)
+            self.use_preprocessed and (has_preprocessed_path_col or has_sample_idx_col)
         )
         if not has_video_col and not self.direct_preprocessed_mode:
             raise ValueError(
                 "CSV missing required columns for legacy mode. Need either "
                 "['video','caption'] or ['caption','preprocessed_path'] / ['caption','sample_idx']"
             )
-        
-        # Pre-scan preprocessed files to avoid per-row os.path.exists calls.
+
+        if self.direct_preprocessed_mode:
+            return self._build_direct_preprocessed_index(df, video_dir, preprocessed_dir, max_samples)
+        return self._build_legacy_index(df, video_dir, preprocessed_dir, max_samples)
+
+    def _build_direct_preprocessed_index(
+        self,
+        df: pd.DataFrame,
+        video_dir: str,
+        preprocessed_dir: Optional[str],
+        max_samples: Optional[int],
+    ) -> List[Dict[str, object]]:
+        work = df.copy()
+        work["caption"] = work["caption"].fillna("").astype(str).str.strip()
+        work = work[work["caption"] != ""].copy()
+
+        if "preprocessed_path" in work.columns:
+            work["preprocessed_path"] = work["preprocessed_path"].fillna("").astype(str).str.strip()
+        else:
+            work["preprocessed_path"] = ""
+
+        if "sample_idx" in work.columns:
+            work["sample_idx"] = pd.to_numeric(work["sample_idx"], errors="coerce")
+        else:
+            work["sample_idx"] = np.nan
+
+        if preprocessed_dir:
+            missing_pre = work["preprocessed_path"] == ""
+            if missing_pre.any():
+                work.loc[missing_pre, "preprocessed_path"] = work.loc[missing_pre, "sample_idx"].map(
+                    lambda x: os.path.join(preprocessed_dir, f"sample_{int(x):08d}.pkl") if pd.notna(x) else ""
+                )
+            work["preprocessed_path"] = work["preprocessed_path"].map(
+                lambda p: os.path.join(preprocessed_dir, p) if p and not os.path.isabs(p) else p
+            )
+
+        work = work[work["preprocessed_path"] != ""].copy()
+        if not self.trust_preprocessed_manifest:
+            work = work[work["preprocessed_path"].map(os.path.exists)].copy()
+
+        if "video" in work.columns:
+            work["video_name"] = work["video"].fillna("").astype(str).str.strip()
+        else:
+            work["video_name"] = ""
+        for candidate_col in ("video_path", "media_path", "image_path", "source_id"):
+            if candidate_col not in work.columns:
+                continue
+            candidate_series = work[candidate_col].fillna("").astype(str).str.strip()
+            missing_mask = work["video_name"] == ""
+            if missing_mask.any():
+                work.loc[missing_mask, "video_name"] = candidate_series.loc[missing_mask].map(os.path.basename)
+        missing_video_name = work["video_name"] == ""
+        if missing_video_name.any():
+            work.loc[missing_video_name, "video_name"] = work.loc[missing_video_name, "preprocessed_path"].map(
+                os.path.basename
+            )
+
+        if "modality" in work.columns:
+            work["modality"] = work["modality"].fillna("").astype(str).str.strip().str.lower()
+        else:
+            work["modality"] = ""
+        missing_modality = work["modality"] == ""
+        if missing_modality.any():
+            work.loc[missing_modality, "modality"] = work.loc[missing_modality, "video_name"].map(
+                lambda name: "image"
+                if str(name).lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+                else "video"
+            )
+        if self.modality_filter is not None:
+            work = work[work["modality"].isin(self.modality_filter)].copy()
+
+        work["video_path"] = ""
+        for candidate_col in ("video_path", "media_path", "image_path"):
+            if candidate_col not in work.columns:
+                continue
+            candidate_series = work[candidate_col].fillna("").astype(str).str.strip()
+            missing_path = work["video_path"] == ""
+            if missing_path.any():
+                work.loc[missing_path, "video_path"] = candidate_series.loc[missing_path]
+        if video_dir:
+            missing_path = work["video_path"] == ""
+            if missing_path.any():
+                work.loc[missing_path, "video_path"] = work.loc[missing_path, "video_name"].map(
+                    lambda name: os.path.join(video_dir, name) if name else ""
+                )
+
+        missing_sample_idx = work["sample_idx"].isna()
+        if missing_sample_idx.any():
+            work.loc[missing_sample_idx, "sample_idx"] = np.arange(len(work))[missing_sample_idx.to_numpy()]
+        work["sample_idx"] = work["sample_idx"].astype(int)
+
+        keep_cols = ["video_path", "video_name", "caption", "preprocessed_path", "sample_idx", "modality"]
+        work = work[keep_cols]
+        if max_samples is not None:
+            work = work.iloc[: int(max_samples)].copy()
+        data = work.to_dict("records")
+        logger.info(
+            "Built direct-preprocessed dataset index with %d samples (trust_manifest=%s)",
+            len(data),
+            self.trust_preprocessed_manifest,
+        )
+        return data
+
+    def _build_legacy_index(
+        self,
+        df: pd.DataFrame,
+        video_dir: str,
+        preprocessed_dir: Optional[str],
+        max_samples: Optional[int],
+    ) -> List[Dict[str, object]]:
         preprocessed_index = None
-        if use_preprocessed and preprocessed_dir and (not self.direct_preprocessed_mode):
+        if self.use_preprocessed and preprocessed_dir:
             try:
                 files = [f for f in os.listdir(preprocessed_dir) if f.endswith(".pkl")]
                 preprocessed_index = set()
@@ -101,91 +389,19 @@ class OpenVidDataset(Dataset):
                 logger.warning(f"Failed to scan preprocessed dir {preprocessed_dir}: {e}")
                 preprocessed_index = None
 
-        # Filter valid entries
-        self.data = []
+        data: List[Dict[str, object]] = []
         for idx, row in enumerate(df.itertuples(index=False), start=0):
             if idx % 100000 == 0 and idx > 0:
-                logger.info(f"Scanned {idx} rows, kept {len(self.data)} samples so far")
-            if max_samples and len(self.data) >= max_samples:
+                logger.info(f"Scanned {idx} rows, kept {len(data)} samples so far")
+            if max_samples and len(data) >= max_samples:
                 break
-            
-            # Validate row data
+
             caption_val = getattr(row, "caption", None)
             if pd.isna(caption_val):
                 logger.warning(f"Skipping row {idx}: missing caption")
                 continue
             caption = str(caption_val).strip()
-            row_modality = None
 
-            # New schema path: preprocessed pickle path is directly provided or derivable from sample_idx.
-            if self.direct_preprocessed_mode:
-                preprocessed_path = None
-                row_preprocessed = getattr(row, "preprocessed_path", None)
-                if row_preprocessed is not None and not pd.isna(row_preprocessed):
-                    preprocessed_path = str(row_preprocessed).strip()
-                if (not preprocessed_path) and preprocessed_dir and hasattr(row, "sample_idx"):
-                    try:
-                        sample_idx = int(getattr(row, "sample_idx"))
-                        preprocessed_path = os.path.join(preprocessed_dir, f"sample_{sample_idx:08d}.pkl")
-                    except Exception:
-                        preprocessed_path = None
-                if not preprocessed_path:
-                    continue
-                if not os.path.isabs(preprocessed_path) and preprocessed_dir:
-                    preprocessed_path = os.path.join(preprocessed_dir, preprocessed_path)
-                if not os.path.exists(preprocessed_path):
-                    continue
-
-                video_val = getattr(row, "video", None)
-                video_name = ""
-                if video_val is not None and not pd.isna(video_val):
-                    video_name = str(video_val).strip()
-                if not video_name:
-                    for candidate_col in ("video_path", "media_path", "image_path", "source_id"):
-                        candidate_val = getattr(row, candidate_col, None)
-                        if candidate_val is not None and not pd.isna(candidate_val):
-                            video_name = os.path.basename(str(candidate_val).strip())
-                            break
-                if not video_name:
-                    video_name = os.path.basename(preprocessed_path)
-                row_modality = str(getattr(row, "modality", "") or "").strip().lower()
-                if not row_modality:
-                    row_modality = "image" if video_name.lower().endswith(
-                        (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-                    ) else "video"
-                if self.modality_filter is not None and row_modality not in self.modality_filter:
-                    continue
-
-                video_path = None
-                for candidate_col in ("video_path", "media_path", "image_path"):
-                    candidate_val = getattr(row, candidate_col, None)
-                    if candidate_val is not None and not pd.isna(candidate_val):
-                        candidate_path = str(candidate_val).strip()
-                        if candidate_path:
-                            video_path = candidate_path
-                            break
-                if video_path is None and video_name:
-                    candidate_path = os.path.join(video_dir, video_name)
-                    if os.path.exists(candidate_path):
-                        video_path = candidate_path
-
-                sample_idx_val = getattr(row, "sample_idx", None)
-                if sample_idx_val is None or pd.isna(sample_idx_val):
-                    sample_idx_val = len(self.data)
-
-                self.data.append(
-                    {
-                        "video_path": video_path,
-                        "video_name": video_name,
-                        "caption": caption,
-                        "preprocessed_path": preprocessed_path,
-                        "sample_idx": int(sample_idx_val),
-                        "modality": row_modality,
-                    }
-                )
-                continue
-
-            # Legacy schema path: expect a 'video' column.
             video_val = getattr(row, "video", None)
             if pd.isna(video_val):
                 logger.warning(f"Skipping row {idx}: missing video")
@@ -198,25 +414,18 @@ class OpenVidDataset(Dataset):
                 ) else "video"
             if self.modality_filter is not None and row_modality not in self.modality_filter:
                 continue
-            
-            # Skip header row if accidentally included
-            if video_name.lower() == 'video' or video_name == 'video,caption,aesthetic score,motion score,temporal consistency score,camera motion,frame,fps,seconds':
+
+            if video_name.lower() == "video" or video_name == "video,caption,aesthetic score,motion score,temporal consistency score,camera motion,frame,fps,seconds":
                 logger.warning(f"Skipping row {idx}: appears to be header row")
                 continue
-            
-            # Validate video name format (should be a filename, not entire CSV row)
-            # Video names should be short filenames, not long text
             if len(video_name) > 255:
                 logger.warning(f"Skipping row {idx}: video name too long ({len(video_name)} chars): {video_name[:50]}...")
                 continue
-            
-            # Video name should look like a filename (has extension or is short)
-            if ',' in video_name and len(video_name) > 100:
+            if "," in video_name and len(video_name) > 100:
                 logger.warning(f"Skipping row {idx}: video name contains comma and is too long, likely malformed CSV row")
                 continue
-            
-            # If using preprocessed mode, check for preprocessed file first
-            if use_preprocessed and preprocessed_dir:
+
+            if self.use_preprocessed and preprocessed_dir:
                 video_basename = os.path.splitext(video_name)[0]
                 candidate_names = [
                     f"{video_basename}_features.pkl",
@@ -224,70 +433,52 @@ class OpenVidDataset(Dataset):
                     f"{video_basename}.pkl",
                     f"{video_name}.pkl",
                 ]
-                # If we have a pre-scanned index, use it.
                 if preprocessed_index is not None:
                     if video_basename not in preprocessed_index and video_name not in preprocessed_index:
                         continue
-                    preprocessed_path = None
-                    for candidate_name in candidate_names:
-                        candidate_path = os.path.join(preprocessed_dir, candidate_name)
-                        if os.path.exists(candidate_path):
-                            preprocessed_path = candidate_path
-                            break
-                    if preprocessed_path is None:
-                        continue
-                else:
-                    # Fallback to filesystem checks.
-                    preprocessed_path = None
-                    for candidate_name in candidate_names:
-                        candidate_path = os.path.join(preprocessed_dir, candidate_name)
-                        if os.path.exists(candidate_path):
-                            preprocessed_path = candidate_path
-                            break
-                    if preprocessed_path is None:
-                        continue
-                
-                # Preprocessed file exists, add to dataset
-                # Video path is optional in preprocessed mode
+                preprocessed_path = None
+                for candidate_name in candidate_names:
+                    candidate_path = os.path.join(preprocessed_dir, candidate_name)
+                    if os.path.exists(candidate_path):
+                        preprocessed_path = candidate_path
+                        break
+                if preprocessed_path is None:
+                    continue
+
                 video_path = os.path.join(video_dir, video_name)
                 if not os.path.exists(video_path):
                     video_path = os.path.join(video_dir, f"{video_name}.mp4")
                     if not os.path.exists(video_path):
-                        video_path = None  # Video not needed if preprocessed exists
-                
-                self.data.append({
-                    'video_path': video_path,
-                    'video_name': video_name,
-                    'caption': caption,
-                    'preprocessed_path': preprocessed_path,
-                    'sample_idx': int(idx),
-                    'modality': row_modality,
-                })
+                        video_path = None
+
+                data.append(
+                    {
+                        "video_path": video_path,
+                        "video_name": video_name,
+                        "caption": caption,
+                        "preprocessed_path": preprocessed_path,
+                        "sample_idx": int(idx),
+                        "modality": row_modality,
+                    }
+                )
             else:
-                # Raw mode: need video file
                 video_path = os.path.join(video_dir, video_name)
                 if not os.path.exists(video_path):
                     video_path = os.path.join(video_dir, f"{video_name}.mp4")
                     if not os.path.exists(video_path):
                         continue
-                
-                self.data.append({
-                    'video_path': video_path,
-                    'video_name': video_name,
-                    'caption': caption,
-                    'preprocessed_path': None,
-                    'sample_idx': int(idx),
-                    'modality': row_modality,
-                })
-        
-        if self.modality_filter is None:
-            logger.info(f"Loaded {len(self.data)} valid samples from OpenVid-style CSV")
-        else:
-            logger.info(
-                "Loaded %d valid samples from OpenVid-style CSV (modality_filter=%s)",
-                len(self.data),
-                sorted(self.modality_filter),
-            )
+
+                data.append(
+                    {
+                        "video_path": video_path,
+                        "video_name": video_name,
+                        "caption": caption,
+                        "preprocessed_path": None,
+                        "sample_idx": int(idx),
+                        "modality": row_modality,
+                    }
+                )
+        return data
     
     def __len__(self):
         """Return the number of samples in the dataset."""
