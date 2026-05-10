@@ -154,8 +154,8 @@ data:
   - 'A short video clip of {prompt}. motion score: {motion_score}.'
   - 'A cinematic video of {prompt}. motion score: {motion_score}.'
   batching:
-    batch_size: 64
-    batch_size_image: 64
+    batch_size: 1
+    batch_size_image: 4
     grad_accum_steps: 1
     shuffle: true
     drop_last: false
