@@ -191,6 +191,17 @@ Benchmark outputs were written to:
 - combined video sheet:
   `output/hf_joint_60k_test/video_frame_samples/all_videos_triptych_grid.png`
 
+### Generation status
+
+The benchmark generation run itself was successful.
+
+- The planned `4 image + 4 video` benchmark batch completed successfully.
+- All benchmark videos were generated as `.mp4` files with `81` frames.
+- Start/middle/end frame triptychs were extracted successfully for the generated
+  videos.
+- Two additional poolside prompt probes were also generated successfully during
+  follow-up prompt-control testing.
+
 ### Prompt groups used
 
 Image sanity prompts:
