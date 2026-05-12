@@ -195,12 +195,15 @@ Benchmark outputs were written to:
 
 The benchmark generation run itself was successful.
 
-- The planned `4 image + 4 video` benchmark batch completed successfully.
+- Benchmark generation date:
+  `2026-05-12`
+- The planned `4 image + 4 video` benchmark batch completed successfully on
+  `2026-05-12`.
 - All benchmark videos were generated as `.mp4` files with `81` frames.
 - Start/middle/end frame triptychs were extracted successfully for the generated
-  videos.
-- Two additional poolside prompt probes were also generated successfully during
-  follow-up prompt-control testing.
+  videos on `2026-05-12`.
+- Two additional poolside prompt probes were also generated successfully on
+  `2026-05-12` during follow-up prompt-control testing.
 
 ### Prompt groups used
 
