@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import math
+from pathlib import Path
 import signal
 import time
 
@@ -17,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval", type=float, default=15.0)
     parser.add_argument("--tensor-mb", type=float, default=4.0)
     parser.add_argument("--all-devices", action="store_true")
+    parser.add_argument("--stop-file", default="", help="Exit gracefully when this file appears.")
     return parser.parse_args()
 
 
@@ -34,6 +36,10 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
+    stop_file = Path(args.stop_file).expanduser() if args.stop_file else None
+
+    def should_stop() -> bool:
+        return stop or (stop_file is not None and stop_file.exists())
 
     device_count = torch.cuda.device_count()
     device_ids = list(range(device_count)) if args.all_devices else [0]
@@ -52,7 +58,7 @@ def main() -> int:
     )
 
     tick = 0
-    while not stop:
+    while not should_stop():
         tick += 1
         for device_id, tensor in zip(device_ids, tensors):
             with torch.cuda.device(device_id):
@@ -60,7 +66,11 @@ def main() -> int:
                 if tick % 128 == 0:
                     tensor.fill_(1.0)
                 torch.cuda.synchronize(device_id)
-        time.sleep(max(1.0, float(args.interval)))
+        sleep_remaining = max(1.0, float(args.interval))
+        while sleep_remaining > 0 and not should_stop():
+            sleep_step = min(1.0, sleep_remaining)
+            time.sleep(sleep_step)
+            sleep_remaining -= sleep_step
 
     print(f"[{args.label}] GPU heartbeat stopped.", flush=True)
     return 0

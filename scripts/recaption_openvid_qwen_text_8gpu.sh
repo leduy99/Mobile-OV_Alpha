@@ -60,11 +60,20 @@ GPU_HEARTBEAT="${GPU_HEARTBEAT:-1}"
 GPU_HEARTBEAT_INTERVAL="${GPU_HEARTBEAT_INTERVAL:-15}"
 GPU_HEARTBEAT_TENSOR_MB="${GPU_HEARTBEAT_TENSOR_MB:-4}"
 MODEL_PRE_DOWNLOADED=0
+TASKS_PER_NODE="${TASKS_PER_NODE:-}"
 
 positive_int() {
   local value="${1:-}"
   [[ "$value" =~ ^[0-9]+$ ]] && [[ "$value" -gt 0 ]]
 }
+
+if [[ -z "$TASKS_PER_NODE" ]]; then
+  if [[ "${SLURM_TASKS_PER_NODE:-}" =~ ^([0-9]+) ]]; then
+    TASKS_PER_NODE="${BASH_REMATCH[1]}"
+  else
+    TASKS_PER_NODE=8
+  fi
+fi
 
 if [[ -z "${NUM_SHARDS:-}" ]]; then
   if positive_int "${SLURM_NTASKS:-}"; then
@@ -79,12 +88,25 @@ if [[ -z "${NUM_SHARDS:-}" ]]; then
 fi
 
 SETUP_HEARTBEAT_PID=""
+SETUP_HEARTBEAT_STOP_FILE=""
 stop_setup_heartbeat() {
   if [[ -n "${SETUP_HEARTBEAT_PID:-}" ]] && kill -0 "$SETUP_HEARTBEAT_PID" 2>/dev/null; then
-    kill "$SETUP_HEARTBEAT_PID" 2>/dev/null || true
+    if [[ -n "${SETUP_HEARTBEAT_STOP_FILE:-}" ]]; then
+      touch "$SETUP_HEARTBEAT_STOP_FILE" 2>/dev/null || true
+    fi
+    for _ in $(seq 1 30); do
+      if ! kill -0 "$SETUP_HEARTBEAT_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if kill -0 "$SETUP_HEARTBEAT_PID" 2>/dev/null; then
+      kill "$SETUP_HEARTBEAT_PID" 2>/dev/null || true
+    fi
     wait "$SETUP_HEARTBEAT_PID" 2>/dev/null || true
   fi
   SETUP_HEARTBEAT_PID=""
+  SETUP_HEARTBEAT_STOP_FILE=""
 }
 trap stop_setup_heartbeat EXIT
 
@@ -103,6 +125,7 @@ echo "model_id=$MODEL_ID"
 echo "num_shards=$NUM_SHARDS"
 echo "slurm_nodes=${SLURM_JOB_NUM_NODES:-unset}"
 echo "slurm_ntasks=${SLURM_NTASKS:-unset}"
+echo "tasks_per_node=$TASKS_PER_NODE"
 echo "auto_install_deps=$AUTO_INSTALL_DEPS"
 echo "pre_download_model=$PRE_DOWNLOAD_MODEL"
 echo "fail_on_error=$FAIL_ON_ERROR"
@@ -121,19 +144,33 @@ echo "tmpdir=$TMPDIR"
 echo "triton_cache_dir=$TRITON_CACHE_DIR"
 
 if [[ "$GPU_HEARTBEAT" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
-  srun --ntasks="$NUM_SHARDS" --gpus-per-task=1 bash -lc '
+  SETUP_HEARTBEAT_STOP_FILE="${TMPDIR%/}/mobileov_setup_heartbeat_stop_${SLURM_JOB_ID}.flag"
+  rm -f "$SETUP_HEARTBEAT_STOP_FILE"
+  echo "Starting setup heartbeat: tasks=$NUM_SHARDS tasks_per_node=$TASKS_PER_NODE gpus_per_task=1 gpu_bind=single:1"
+  srun --overlap \
+    --ntasks="$NUM_SHARDS" \
+    --ntasks-per-node="$TASKS_PER_NODE" \
+    --gpus-per-task=1 \
+    --gpu-bind=single:1 \
+    bash -lc '
 set -euo pipefail
 export PATH="'"$ENV_PATH"'/bin:$PATH"
 cd "'"$PWD"'"
 export PYTHONNOUSERSITE=1
 export PYTHONPATH="./:${PYTHONPATH:-}"
 "'"$PYTHON_BIN"'" tools/data_prepare/gpu_heartbeat.py \
-  --label "recaption-setup-'"${SLURM_JOB_ID}"'-${SLURM_PROCID}" \
+  --label "recaption-setup-'"${SLURM_JOB_ID}"'-node-${SLURMD_NODENAME}-rank-${SLURM_PROCID}" \
   --interval "'"$GPU_HEARTBEAT_INTERVAL"'" \
-  --tensor-mb "'"$GPU_HEARTBEAT_TENSOR_MB"'"
+  --tensor-mb "'"$GPU_HEARTBEAT_TENSOR_MB"'" \
+  --stop-file "'"$SETUP_HEARTBEAT_STOP_FILE"'"
 ' &
   SETUP_HEARTBEAT_PID="$!"
   sleep 3
+  if ! kill -0 "$SETUP_HEARTBEAT_PID" 2>/dev/null; then
+    wait "$SETUP_HEARTBEAT_PID" 2>/dev/null || true
+    echo "Setup GPU heartbeat failed to start; aborting to avoid idle-GPU job cancellation." >&2
+    exit 1
+  fi
 fi
 
 if [[ "$AUTO_INSTALL_DEPS" == "1" ]]; then
@@ -162,7 +199,12 @@ fi
 
 stop_setup_heartbeat
 
-srun --ntasks="$NUM_SHARDS" --gpus-per-task=1 bash -lc '
+srun \
+  --ntasks="$NUM_SHARDS" \
+  --ntasks-per-node="$TASKS_PER_NODE" \
+  --gpus-per-task=1 \
+  --gpu-bind=single:1 \
+  bash -lc '
 set -euo pipefail
 export PATH="'"$ENV_PATH"'/bin:$PATH"
 cd "'"$PWD"'"
