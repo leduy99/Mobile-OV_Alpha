@@ -1,28 +1,44 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=openvid_qwen_recap
-#SBATCH --partition=gpu
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:8
+#SBATCH --job-name=mobile-ov
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=8
-#SBATCH --gpus-per-task=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=512G
-#SBATCH --time=2-00:00:00
-#SBATCH --output=output/logs/%x_%j.out
+#SBATCH --time=72:00:00
+#SBATCH --output=logs/slurmm1.0-%j.out
+#SBATCH --error=logs/slurmm1.0-%j.out
+#SBATCH --account=berzelius-2025-436
+##SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:A100-SXM4-80GB:8
 
 set -euo pipefail
 
-source /share_0/conda/etc/profile.d/conda.sh
-conda activate "${CONDA_ENV:-mobileov}"
+if command -v module >/dev/null 2>&1; then
+  module load buildenv-gcccuda/12.1.1-gcc12.3.0
+fi
+
+ENV_PATH="${ENV_PATH:-${CONDA_ENV_PATH:-/proj/cvl/users/x_fahkh2/envs/mobileov}}"
+if [[ ! -x "$ENV_PATH/bin/python" ]]; then
+  echo "Python env not found: $ENV_PATH/bin/python" >&2
+  exit 1
+fi
+export PATH="$ENV_PATH/bin:$PATH"
 
 export PYTHONNOUSERSITE=1
-export PYTHONPATH=.
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
-HF_BIN="${HF_BIN:-hf}"
-
-CACHE_ROOT="${CACHE_ROOT:-$PWD/download_data/checkpoints/huggingface}"
-export HF_HOME="${HF_HOME:-$CACHE_ROOT}"
+export PYTHONPATH="./:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-/proj/cvl/users/x_fahkh2/caches}"
+export TORCH_HOME="${TORCH_HOME:-/proj/cvl/users/x_fahkh2/caches}"
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/proj/cvl/users/x_fahkh2/caches}"
+export TMPDIR="${TMPDIR:-/proj/cvl/users/x_fahkh2/caches}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/proj/cvl/users/x_fahkh2/caches}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+
+PYTHON_BIN="${PYTHON_BIN:-$ENV_PATH/bin/python}"
+HF_BIN="${HF_BIN:-$ENV_PATH/bin/hf}"
+if [[ ! -x "$HF_BIN" ]]; then
+  HF_BIN="hf"
+fi
+export ENV_PATH PYTHON_BIN HF_BIN
+
+CACHE_ROOT="${CACHE_ROOT:-$HF_HOME}"
 
 INPUT_CSV="${INPUT_CSV:-download_data/data/openvid/manifests/openvid_all.csv}"
 OUT_DIR="${OUT_DIR:-download_data/data/openvid/recaption/qwen3p6_35b_a3b}"
@@ -72,7 +88,8 @@ stop_setup_heartbeat() {
 }
 trap stop_setup_heartbeat EXIT
 
-mkdir -p "$OUT_DIR" output/logs "$(dirname "$OUTPUT_CSV")" "$HF_HOME" "$HF_HUB_CACHE"
+mkdir -p "$OUT_DIR" output/logs logs "$(dirname "$OUTPUT_CSV")" \
+  "$HF_HOME" "$HF_HUB_CACHE" "$TORCH_HOME" "$PIP_CACHE_DIR" "$TMPDIR" "$TRITON_CACHE_DIR"
 
 if [[ ! -f "$INPUT_CSV" ]]; then
   echo "Input CSV not found: $INPUT_CSV" >&2
@@ -94,18 +111,22 @@ echo "retry_failed=$RETRY_FAILED"
 echo "overwrite_parts=$OVERWRITE_PARTS"
 echo "save_every=$SAVE_EVERY"
 echo "python_bin=$PYTHON_BIN"
+echo "env_path=$ENV_PATH"
 echo "gpu_heartbeat=$GPU_HEARTBEAT"
 echo "hf_home=$HF_HOME"
 echo "hf_hub_cache=$HF_HUB_CACHE"
+echo "torch_home=$TORCH_HOME"
+echo "pip_cache_dir=$PIP_CACHE_DIR"
+echo "tmpdir=$TMPDIR"
+echo "triton_cache_dir=$TRITON_CACHE_DIR"
 
 if [[ "$GPU_HEARTBEAT" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
   srun --ntasks="$NUM_SHARDS" --gpus-per-task=1 bash -lc '
 set -euo pipefail
-source /share_0/conda/etc/profile.d/conda.sh
-conda activate "${CONDA_ENV:-mobileov}"
+export PATH="'"$ENV_PATH"'/bin:$PATH"
 cd "'"$PWD"'"
 export PYTHONNOUSERSITE=1
-export PYTHONPATH=.
+export PYTHONPATH="./:${PYTHONPATH:-}"
 "'"$PYTHON_BIN"'" tools/data_prepare/gpu_heartbeat.py \
   --label "recaption-setup-'"${SLURM_JOB_ID}"'-${SLURM_PROCID}" \
   --interval "'"$GPU_HEARTBEAT_INTERVAL"'" \
@@ -121,7 +142,8 @@ if [[ "$AUTO_INSTALL_DEPS" == "1" ]]; then
     INSTALL_ARGS+=(--download-model)
     MODEL_PRE_DOWNLOADED=1
   fi
-  CONDA_ENV="${CONDA_ENV:-mobileov}" MODEL_ID="$MODEL_ID" \
+  ENV_PATH="$ENV_PATH" MODEL_ID="$MODEL_ID" CACHE_ROOT="$CACHE_ROOT" HF_HOME="$HF_HOME" HF_HUB_CACHE="$HF_HUB_CACHE" \
+    TORCH_HOME="$TORCH_HOME" PIP_CACHE_DIR="$PIP_CACHE_DIR" TMPDIR="$TMPDIR" TRITON_CACHE_DIR="$TRITON_CACHE_DIR" \
     bash scripts/install_qwen36_recaption_deps.sh "${INSTALL_ARGS[@]}"
 fi
 
@@ -142,11 +164,10 @@ stop_setup_heartbeat
 
 srun --ntasks="$NUM_SHARDS" --gpus-per-task=1 bash -lc '
 set -euo pipefail
-source /share_0/conda/etc/profile.d/conda.sh
-conda activate "${CONDA_ENV:-mobileov}"
+export PATH="'"$ENV_PATH"'/bin:$PATH"
 cd "'"$PWD"'"
 export PYTHONNOUSERSITE=1
-export PYTHONPATH=.
+export PYTHONPATH="./:${PYTHONPATH:-}"
 WORKER_HEARTBEAT_PID=""
 cleanup_worker_heartbeat() {
   if [[ -n "${WORKER_HEARTBEAT_PID:-}" ]] && kill -0 "$WORKER_HEARTBEAT_PID" 2>/dev/null; then
