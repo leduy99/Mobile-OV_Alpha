@@ -6,6 +6,13 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3.6-35B-A3B}"
 DOWNLOAD_MODEL=0
 export MODEL_ID
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CACHE_ROOT="${CACHE_ROOT:-$REPO_ROOT/download_data/checkpoints/huggingface}"
+export HF_HOME="${HF_HOME:-$CACHE_ROOT}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+mkdir -p "$HF_HOME" "$HF_HUB_CACHE"
+
 for arg in "$@"; do
   case "$arg" in
     --download-model)
@@ -21,6 +28,10 @@ done
 source /share_0/conda/etc/profile.d/conda.sh
 conda activate "$CONDA_ENV"
 export PYTHONNOUSERSITE=1
+
+echo "Qwen recaption cache:"
+echo "  HF_HOME=$HF_HOME"
+echo "  HF_HUB_CACHE=$HF_HUB_CACHE"
 
 python -m pip install -U \
   "transformers>=4.57.0" \

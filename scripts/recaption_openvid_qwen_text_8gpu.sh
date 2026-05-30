@@ -20,6 +20,10 @@ export PYTHONPATH=.
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python)}"
 HF_BIN="${HF_BIN:-hf}"
 
+CACHE_ROOT="${CACHE_ROOT:-$PWD/download_data/checkpoints/huggingface}"
+export HF_HOME="${HF_HOME:-$CACHE_ROOT}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+
 INPUT_CSV="${INPUT_CSV:-download_data/data/openvid/manifests/openvid_all.csv}"
 OUT_DIR="${OUT_DIR:-download_data/data/openvid/recaption/qwen3p6_35b_a3b}"
 OUTPUT_CSV="${OUTPUT_CSV:-download_data/data/openvid/manifests/openvid_all_recaptions.csv}"
@@ -68,7 +72,7 @@ stop_setup_heartbeat() {
 }
 trap stop_setup_heartbeat EXIT
 
-mkdir -p "$OUT_DIR" output/logs "$(dirname "$OUTPUT_CSV")"
+mkdir -p "$OUT_DIR" output/logs "$(dirname "$OUTPUT_CSV")" "$HF_HOME" "$HF_HUB_CACHE"
 
 if [[ ! -f "$INPUT_CSV" ]]; then
   echo "Input CSV not found: $INPUT_CSV" >&2
@@ -91,6 +95,8 @@ echo "overwrite_parts=$OVERWRITE_PARTS"
 echo "save_every=$SAVE_EVERY"
 echo "python_bin=$PYTHON_BIN"
 echo "gpu_heartbeat=$GPU_HEARTBEAT"
+echo "hf_home=$HF_HOME"
+echo "hf_hub_cache=$HF_HUB_CACHE"
 
 if [[ "$GPU_HEARTBEAT" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
   srun --ntasks="$NUM_SHARDS" --gpus-per-task=1 bash -lc '
