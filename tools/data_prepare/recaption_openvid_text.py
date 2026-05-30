@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing shard output.")
     parser.add_argument("--retry-failed", action="store_true", help="Retry rows previously marked failed.")
     parser.add_argument("--fail-on-error", action="store_true", help="Abort instead of writing fallback captions on recaption errors.")
+    parser.add_argument(
+        "--no-global-resume",
+        action="store_true",
+        help="Only skip rows already present in this shard file. By default all part_*.csv files are used.",
+    )
+    parser.add_argument("--resume-part-glob", default="part_*.csv", help="Part glob used for global resume.")
     parser.add_argument("--trust-remote-code", action="store_true", default=True)
     return parser.parse_args()
 
@@ -96,12 +102,19 @@ def load_processed_rows(path: Path, retry_failed: bool) -> set[int]:
     if not path.exists():
         return set()
     try:
-        df = pd.read_csv(path, usecols=["recaption_row_id", "caption_status"])
+        df = pd.read_csv(path, usecols=["recaption_row_id", "caption_status"], on_bad_lines="skip")
     except Exception:
         return set()
     if retry_failed:
         df = df[df["caption_status"].fillna("").astype(str).str.lower().ne("failed")]
     return {int(x) for x in pd.to_numeric(df["recaption_row_id"], errors="coerce").dropna().astype(int)}
+
+
+def load_processed_rows_from_parts(output_dir: Path, part_glob: str, retry_failed: bool) -> set[int]:
+    processed: set[int] = set()
+    for path in sorted(output_dir.glob(part_glob)):
+        processed.update(load_processed_rows(path, retry_failed=retry_failed))
+    return processed
 
 
 def make_fieldnames(input_columns: List[str]) -> List[str]:
@@ -178,7 +191,15 @@ def main() -> int:
     if args.caption_column not in df.columns:
         raise ValueError(f"Input CSV missing caption column: {args.caption_column}")
 
-    processed = load_processed_rows(output_csv, retry_failed=bool(args.retry_failed))
+    if args.no_global_resume:
+        processed = load_processed_rows(output_csv, retry_failed=bool(args.retry_failed))
+    else:
+        processed = load_processed_rows_from_parts(
+            output_dir,
+            part_glob=args.resume_part_glob,
+            retry_failed=bool(args.retry_failed),
+        )
+    LOGGER.info("Resume index loaded: processed_rows=%d global_resume=%s", len(processed), not args.no_global_resume)
     captioner = build_captioner(args)
     fieldnames = make_fieldnames(list(df.columns))
     append = output_csv.exists() and not args.overwrite

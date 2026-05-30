@@ -35,7 +35,10 @@ def parse_args() -> argparse.Namespace:
 def read_parts(parts: List[Path]) -> pd.DataFrame:
     frames = []
     for path in parts:
-        frames.append(pd.read_csv(path))
+        try:
+            frames.append(pd.read_csv(path, on_bad_lines="skip"))
+        except pd.errors.EmptyDataError:
+            continue
     if not frames:
         return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
