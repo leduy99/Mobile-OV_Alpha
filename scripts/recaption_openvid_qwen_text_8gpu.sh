@@ -60,6 +60,7 @@ GPU_HEARTBEAT="${GPU_HEARTBEAT:-1}"
 GPU_HEARTBEAT_INTERVAL="${GPU_HEARTBEAT_INTERVAL:-15}"
 GPU_HEARTBEAT_TENSOR_MB="${GPU_HEARTBEAT_TENSOR_MB:-4}"
 MODEL_PRE_DOWNLOADED=0
+NUM_NODES="${NUM_NODES:-${SLURM_JOB_NUM_NODES:-1}}"
 TASKS_PER_NODE="${TASKS_PER_NODE:-}"
 
 positive_int() {
@@ -76,7 +77,9 @@ if [[ -z "$TASKS_PER_NODE" ]]; then
 fi
 
 if [[ -z "${NUM_SHARDS:-}" ]]; then
-  if positive_int "${SLURM_NTASKS:-}"; then
+  if positive_int "$NUM_NODES" && positive_int "$TASKS_PER_NODE"; then
+    NUM_SHARDS=$((NUM_NODES * TASKS_PER_NODE))
+  elif positive_int "${SLURM_NTASKS:-}"; then
     NUM_SHARDS="$SLURM_NTASKS"
   elif positive_int "${SLURM_GPUS:-}"; then
     NUM_SHARDS="$SLURM_GPUS"
@@ -123,6 +126,7 @@ echo "out_dir=$OUT_DIR"
 echo "output_csv=$OUTPUT_CSV"
 echo "model_id=$MODEL_ID"
 echo "num_shards=$NUM_SHARDS"
+echo "num_nodes=$NUM_NODES"
 echo "slurm_nodes=${SLURM_JOB_NUM_NODES:-unset}"
 echo "slurm_ntasks=${SLURM_NTASKS:-unset}"
 echo "tasks_per_node=$TASKS_PER_NODE"
@@ -148,6 +152,7 @@ if [[ "$GPU_HEARTBEAT" == "1" && -n "${SLURM_JOB_ID:-}" ]]; then
   rm -f "$SETUP_HEARTBEAT_STOP_FILE"
   echo "Starting setup heartbeat: tasks=$NUM_SHARDS tasks_per_node=$TASKS_PER_NODE gpus_per_task=1 gpu_bind=single:1"
   srun --overlap \
+    --nodes="$NUM_NODES" \
     --ntasks="$NUM_SHARDS" \
     --ntasks-per-node="$TASKS_PER_NODE" \
     --gpus-per-task=1 \
@@ -200,6 +205,7 @@ fi
 stop_setup_heartbeat
 
 srun \
+  --nodes="$NUM_NODES" \
   --ntasks="$NUM_SHARDS" \
   --ntasks-per-node="$TASKS_PER_NODE" \
   --gpus-per-task=1 \
