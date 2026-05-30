@@ -5,7 +5,15 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 MAX_GPUS="${MAX_GPUS:-8}"
 
 CFG="${CFG:-configs/stage1_joint_openvid_fullmobile_o_fulldit_diffonly_initlatest_v2_bs64_8gpu.yaml}"
-OPENVID_CSV="${OPENVID_CSV:-download_data/data/openvid/manifests/openvid_all.csv}"
+DEFAULT_OPENVID_CSV="download_data/data/openvid/manifests/openvid_all.csv"
+DEFAULT_OPENVID_RECAPTION_CSV="download_data/data/openvid/manifests/openvid_all_recaptions.csv"
+if [[ -z "${OPENVID_CSV:-}" ]]; then
+  if [[ -f "$DEFAULT_OPENVID_RECAPTION_CSV" ]]; then
+    OPENVID_CSV="$DEFAULT_OPENVID_RECAPTION_CSV"
+  else
+    OPENVID_CSV="$DEFAULT_OPENVID_CSV"
+  fi
+fi
 OPENVID_ENC="${OPENVID_ENC:-download_data/data/openvid/encoded/wan_vae_openvid_all}"
 IMAGE_CSV="${IMAGE_CSV:-data/full_mobile-o/manifests/journeydb_short_caption_train_ready.csv}"
 JOINT_PREFIX="${JOINT_PREFIX:-data/mix/manifests/joint_openvid_fullmobile_5v1i}"

@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 import time
+import random
 import numpy as np
 import torch
 import pandas as pd
@@ -13,9 +14,10 @@ from typing import Optional, List, Dict, Set, Union
 
 logger = logging.getLogger(__name__)
 
-_DATASET_CACHE_VERSION = 1
+_DATASET_CACHE_VERSION = 2
 _DATASET_CACHE_WAIT_SECONDS = 2.0
 _DATASET_CACHE_STALE_LOCK_SECONDS = 60.0 * 30.0
+_DEFAULT_CAPTION_VARIANT_COLUMNS = ["caption_short", "caption_medium", "caption_long"]
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -23,6 +25,35 @@ def _env_flag(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_list(name: str, default: List[str]) -> List[str]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return list(default)
+    values = [item.strip() for item in str(raw).split(",") if item.strip()]
+    return values or list(default)
+
+
+def _env_float_list(name: str, expected_len: int) -> Optional[List[float]]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    values = []
+    for item in str(raw).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        values.append(float(item))
+    if len(values) != expected_len:
+        raise ValueError(f"{name} must contain exactly {expected_len} comma-separated weights")
+    return values
+
+
+def _clean_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return " ".join(str(value).split()).strip()
 
 
 class OpenVidDataset(Dataset):
@@ -61,6 +92,13 @@ class OpenVidDataset(Dataset):
         self.rank = int(os.environ.get("RANK", "0") or 0)
         self.dataset_cache_enabled = _env_flag("MOBILEOV_DATASET_CACHE", True)
         self.trust_preprocessed_manifest = _env_flag("MOBILEOV_TRUST_PREPROCESSED_MANIFEST", True)
+        self.caption_aug_enabled = _env_flag("MOBILEOV_CAPTION_AUG", True)
+        self.caption_variant_columns = _env_list("MOBILEOV_CAPTION_AUG_COLUMNS", _DEFAULT_CAPTION_VARIANT_COLUMNS)
+        self.caption_variant_weights = _env_float_list(
+            "MOBILEOV_CAPTION_AUG_WEIGHTS",
+            expected_len=len(self.caption_variant_columns),
+        )
+        self.caption_fallback_column = os.environ.get("MOBILEOV_CAPTION_FALLBACK_COLUMN", "caption").strip() or "caption"
         self.modality_filter: Optional[Set[str]] = None
         if modality_filter is not None:
             if isinstance(modality_filter, str):
@@ -121,6 +159,10 @@ class OpenVidDataset(Dataset):
             "max_samples": int(max_samples) if max_samples is not None else None,
             "modality_filter": sorted(self.modality_filter) if self.modality_filter is not None else None,
             "trust_preprocessed_manifest": bool(self.trust_preprocessed_manifest),
+            "caption_aug_enabled": bool(self.caption_aug_enabled),
+            "caption_variant_columns": list(self.caption_variant_columns),
+            "caption_variant_weights": list(self.caption_variant_weights) if self.caption_variant_weights else None,
+            "caption_fallback_column": str(self.caption_fallback_column),
         }
         key_text = json.dumps(cache_key, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha1(key_text.encode("utf-8")).hexdigest()[:16]
@@ -279,6 +321,9 @@ class OpenVidDataset(Dataset):
         work = df.copy()
         work["caption"] = work["caption"].fillna("").astype(str).str.strip()
         work = work[work["caption"] != ""].copy()
+        for col in self.caption_variant_columns:
+            if col in work.columns:
+                work[col] = work[col].fillna("").astype(str).map(lambda x: " ".join(str(x).split()).strip())
 
         if "preprocessed_path" in work.columns:
             work["preprocessed_path"] = work["preprocessed_path"].fillna("").astype(str).str.strip()
@@ -356,6 +401,7 @@ class OpenVidDataset(Dataset):
         work["sample_idx"] = work["sample_idx"].astype(int)
 
         keep_cols = ["video_path", "video_name", "caption", "preprocessed_path", "sample_idx", "modality"]
+        keep_cols.extend([col for col in self.caption_variant_columns if col in work.columns])
         work = work[keep_cols]
         if max_samples is not None:
             work = work.iloc[: int(max_samples)].copy()
@@ -401,6 +447,10 @@ class OpenVidDataset(Dataset):
                 logger.warning(f"Skipping row {idx}: missing caption")
                 continue
             caption = str(caption_val).strip()
+            caption_payload = {"caption": caption}
+            for col in self.caption_variant_columns:
+                if hasattr(row, col):
+                    caption_payload[col] = _clean_text(getattr(row, col))
 
             video_val = getattr(row, "video", None)
             if pd.isna(video_val):
@@ -456,6 +506,7 @@ class OpenVidDataset(Dataset):
                         "video_path": video_path,
                         "video_name": video_name,
                         "caption": caption,
+                        **{k: v for k, v in caption_payload.items() if k != "caption"},
                         "preprocessed_path": preprocessed_path,
                         "sample_idx": int(idx),
                         "modality": row_modality,
@@ -473,6 +524,7 @@ class OpenVidDataset(Dataset):
                         "video_path": video_path,
                         "video_name": video_name,
                         "caption": caption,
+                        **{k: v for k, v in caption_payload.items() if k != "caption"},
                         "preprocessed_path": None,
                         "sample_idx": int(idx),
                         "modality": row_modality,
@@ -508,15 +560,17 @@ class OpenVidDataset(Dataset):
         while try_idx < max_retries:
             try:
                 item = self.data[real_idx]
+                selected_prompt, selected_caption_mode = self._sample_caption(item)
                 
                 if self.use_preprocessed and item.get('preprocessed_path') and os.path.exists(item['preprocessed_path']):
                     # Load from preprocessed pickle file
                     with open(item['preprocessed_path'], 'rb') as f:
                         data = pickle.load(f)
                     
-                    # Ensure required keys
-                    if 'prompt' not in data:
-                        data['prompt'] = item.get('caption', '')
+                    # Always override prompt from the manifest. Preprocessed pkl files
+                    # may contain stale prompts from the original caption.
+                    data['prompt'] = selected_prompt
+                    data['caption_mode'] = selected_caption_mode
                     
                     # Convert to tensors if needed
                     for key in data:
@@ -538,7 +592,8 @@ class OpenVidDataset(Dataset):
                     # Note: This mode requires additional processing in training loop
                     return {
                         'video_path': item.get('video_path'),
-                        'prompt': item.get('caption', ''),
+                        'prompt': selected_prompt,
+                        'caption_mode': selected_caption_mode,
                         'video_name': item.get('video_name', ''),
                         'sample_idx': int(real_idx),
                         'modality': item.get('modality', 'video'),
@@ -560,6 +615,28 @@ class OpenVidDataset(Dataset):
             'latent_feature': torch.zeros(1, 16, 21, 32, 32),  # Dummy shape
             'sample_idx': int(real_idx),
         }
+
+    def _sample_caption(self, item: Dict[str, object]) -> tuple[str, str]:
+        fallback = _clean_text(item.get(self.caption_fallback_column, item.get("caption", "")))
+        if not self.caption_aug_enabled:
+            return fallback, self.caption_fallback_column
+
+        variants = []
+        weights = []
+        for idx, col in enumerate(self.caption_variant_columns):
+            text = _clean_text(item.get(col, ""))
+            if not text:
+                continue
+            variants.append((text, col))
+            if self.caption_variant_weights is not None:
+                weights.append(float(self.caption_variant_weights[idx]))
+            else:
+                weights.append(1.0)
+
+        if not variants:
+            return fallback, self.caption_fallback_column
+        selected_text, selected_mode = random.choices(variants, weights=weights, k=1)[0]
+        return selected_text, selected_mode
 
 
 def openvid_collate_fn(batch):

@@ -28,6 +28,22 @@ REQUIRED_OUTPUT_COLUMNS = [
     "sample_idx",
 ]
 
+CAPTION_AUG_COLUMNS = [
+    "caption_short",
+    "caption_medium",
+    "caption_long",
+    "caption_source",
+    "caption_status",
+    "caption_error",
+]
+
+
+def _output_columns(include_caption_aug: bool) -> List[str]:
+    columns = list(REQUIRED_OUTPUT_COLUMNS)
+    if include_caption_aug:
+        columns.extend([col for col in CAPTION_AUG_COLUMNS if col not in columns])
+    return columns
+
 
 def _resolve_repo_relative(path_text: str, cwd: Path) -> str:
     text = str(path_text or "").strip()
@@ -50,6 +66,21 @@ def _first_present(row: pd.Series, keys: List[str]) -> str:
     return ""
 
 
+def _normalize_optional_caption_columns(df: pd.DataFrame, *, include_caption_aug: bool) -> pd.DataFrame:
+    if not include_caption_aug:
+        return df
+    out = df.copy()
+    for col in CAPTION_AUG_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].fillna("").astype(str).str.strip()
+    for col in ("caption_short", "caption_medium", "caption_long"):
+        empty = out[col].eq("")
+        if empty.any():
+            out.loc[empty, col] = out.loc[empty, "caption"]
+    return out
+
+
 def _load_image_rows(image_manifest: Path, cwd: Path) -> pd.DataFrame:
     df = pd.read_csv(image_manifest).copy()
     missing = [c for c in REQUIRED_OUTPUT_COLUMNS if c not in df.columns]
@@ -64,7 +95,8 @@ def _load_image_rows(image_manifest: Path, cwd: Path) -> pd.DataFrame:
     df["sample_idx"] = df["sample_idx"].astype(int)
     df["preprocessed_path"] = df["preprocessed_path"].fillna("").astype(str).map(lambda p: _resolve_repo_relative(p, cwd))
     df["video_path"] = df["video_path"].fillna("").astype(str).map(lambda p: _resolve_repo_relative(p, cwd))
-    return df[REQUIRED_OUTPUT_COLUMNS].copy()
+    df = _normalize_optional_caption_columns(df, include_caption_aug=True)
+    return df[_output_columns(include_caption_aug=True)].copy()
 
 
 def _load_openvid_rows(openvid_manifest: Path, openvid_preprocessed_dir: Path, cwd: Path) -> pd.DataFrame:
@@ -126,7 +158,8 @@ def _load_openvid_rows(openvid_manifest: Path, openvid_preprocessed_dir: Path, c
     )
 
     df["modality"] = "video"
-    return df[REQUIRED_OUTPUT_COLUMNS].copy()
+    df = _normalize_optional_caption_columns(df, include_caption_aug=True)
+    return df[_output_columns(include_caption_aug=True)].copy()
 
 
 def build_joint_manifest(
