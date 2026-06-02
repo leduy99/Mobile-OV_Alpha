@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -59,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing shard output.")
     parser.add_argument("--retry-failed", action="store_true", help="Retry rows previously marked failed.")
     parser.add_argument("--fail-on-error", action="store_true", help="Abort instead of writing fallback captions on recaption errors.")
+    parser.add_argument("--log-every", type=int, default=10, help="Log active row progress every N generated rows.")
     parser.add_argument(
         "--no-global-resume",
         action="store_true",
@@ -204,6 +206,8 @@ def main() -> int:
     fieldnames = make_fieldnames(list(df.columns))
     append = output_csv.exists() and not args.overwrite
     rows_seen = rows_written = skipped = 0
+    active_rows_seen = 0
+    log_every = max(1, int(args.log_every))
 
     with output_csv.open("a" if append else "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
@@ -214,8 +218,32 @@ def main() -> int:
             if row_id in processed:
                 skipped += 1
                 continue
-            writer.writerow(row_to_output(row_id, row, args.caption_column, captioner, fail_on_error=bool(args.fail_on_error)))
+            active_rows_seen += 1
+            should_log = active_rows_seen <= 3 or active_rows_seen % log_every == 0
+            if should_log:
+                LOGGER.info(
+                    "Shard %d/%d row_id=%d start active=%d seen=%d skipped=%d",
+                    int(args.shard_id),
+                    int(args.num_shards),
+                    int(row_id),
+                    active_rows_seen,
+                    rows_seen,
+                    skipped,
+                )
+            started_at = time.time()
+            output_row = row_to_output(row_id, row, args.caption_column, captioner, fail_on_error=bool(args.fail_on_error))
+            writer.writerow(output_row)
             rows_written += 1
+            if should_log or output_row.get("caption_status") != "ok":
+                LOGGER.info(
+                    "Shard %d/%d row_id=%d done status=%s elapsed=%.2fs written=%d",
+                    int(args.shard_id),
+                    int(args.num_shards),
+                    int(row_id),
+                    output_row.get("caption_status"),
+                    time.time() - started_at,
+                    rows_written,
+                )
             if rows_written % max(1, int(args.save_every)) == 0:
                 f.flush()
                 os.fsync(f.fileno())

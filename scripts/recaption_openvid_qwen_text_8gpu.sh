@@ -59,6 +59,8 @@ FAIL_ON_ERROR="${FAIL_ON_ERROR:-1}"
 GPU_HEARTBEAT="${GPU_HEARTBEAT:-1}"
 GPU_HEARTBEAT_INTERVAL="${GPU_HEARTBEAT_INTERVAL:-15}"
 GPU_HEARTBEAT_TENSOR_MB="${GPU_HEARTBEAT_TENSOR_MB:-4}"
+MODEL_LOAD_STAGGER_SECONDS="${MODEL_LOAD_STAGGER_SECONDS:-15}"
+LOG_EVERY="${LOG_EVERY:-10}"
 MODEL_PRE_DOWNLOADED=0
 NUM_NODES="${NUM_NODES:-${SLURM_JOB_NUM_NODES:-1}}"
 TASKS_PER_NODE="${TASKS_PER_NODE:-}"
@@ -140,6 +142,8 @@ echo "save_every=$SAVE_EVERY"
 echo "python_bin=$PYTHON_BIN"
 echo "env_path=$ENV_PATH"
 echo "gpu_heartbeat=$GPU_HEARTBEAT"
+echo "model_load_stagger_seconds=$MODEL_LOAD_STAGGER_SECONDS"
+echo "log_every=$LOG_EVERY"
 echo "hf_home=$HF_HOME"
 echo "hf_hub_cache=$HF_HUB_CACHE"
 echo "torch_home=$TORCH_HOME"
@@ -250,6 +254,12 @@ if [[ "'"$GPU_HEARTBEAT"'" == "1" ]]; then
   WORKER_HEARTBEAT_PID="$!"
   sleep 3
 fi
+if [[ "'"$MODEL_LOAD_STAGGER_SECONDS"'" != "0" ]]; then
+  LOCAL_RANK="${SLURM_LOCALID:-0}"
+  STAGGER_SLEEP=$((LOCAL_RANK * "'"$MODEL_LOAD_STAGGER_SECONDS"'"))
+  echo "recaption-worker-${SLURM_PROCID}: node=${SLURMD_NODENAME:-unknown} local_rank=${LOCAL_RANK} sleep_before_model_load=${STAGGER_SLEEP}s"
+  sleep "$STAGGER_SLEEP"
+fi
 "'"$PYTHON_BIN"'" tools/data_prepare/recaption_openvid_text.py \
   --input-csv "'"$INPUT_CSV"'" \
   --output-dir "'"$OUT_DIR"'" \
@@ -262,6 +272,7 @@ fi
   --max-new-tokens "'"$MAX_NEW_TOKENS"'" \
   --temperature "'"$TEMPERATURE"'" \
   --top-p "'"$TOP_P"'" \
+  --log-every "'"$LOG_EVERY"'" \
   "${LIMIT_ARGS[@]}" \
   "${FAIL_ARGS[@]}" \
   "${RESUME_ARGS[@]}"
